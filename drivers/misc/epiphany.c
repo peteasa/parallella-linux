@@ -1584,12 +1584,9 @@ static long elink_char_ioctl(struct file *file, unsigned int cmd,
 	/* Do we really need to do this check?
 	 * Isn't copy_to_user() already doing that? */
 	if (_IOC_DIR(cmd) & _IOC_READ) {
-		err =
-		    !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
+		err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
 	} else if (_IOC_DIR(cmd) & _IOC_WRITE) {
-		err =
-		    !access_ok(VERIFY_WRITE, (void __user *)arg,
-			       _IOC_SIZE(cmd));
+		err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
 	}
 
 	if (err)
@@ -1710,14 +1707,10 @@ static long mesh_char_ioctl(struct file *file, unsigned int cmd,
 
 	/* Do we really need to do this check?
 	 * Isn't copy_to_user() already doing that? */
-	if (_IOC_DIR(cmd) & _IOC_READ) {
-		err =
-		    !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
-	} else if (_IOC_DIR(cmd) & _IOC_WRITE) {
-		err =
-		    !access_ok(VERIFY_WRITE, (void __user *)arg,
-			       _IOC_SIZE(cmd));
-	}
+	if (_IOC_DIR(cmd) & _IOC_READ)
+		err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
+	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+		err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
 
 	if (err)
 		return -EFAULT;
