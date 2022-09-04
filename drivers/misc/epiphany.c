@@ -32,6 +32,7 @@
 #include <linux/wait.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
+#include <linux/mmap_lock.h>
 
 #include "epiphany.h"
 
@@ -928,7 +929,7 @@ retry:
 			continue;
 		}
 
-		if (!down_read_trylock(&mm->mmap_sem)) {
+		if (!mmap_read_trylock(mm)) {
 			mmput(mm);
 			put_task_struct(task);
 			mutex_unlock(&epiphany.driver_lock);
@@ -940,7 +941,7 @@ retry:
 			zap_vma_ptes(vma, vma->vm_start,
 				     vma->vm_end - vma->vm_start);
 		}
-		up_read(&mm->mmap_sem);
+		mmap_read_unlock(mm);
 
 		mmput(mm);
 		put_task_struct(task);
