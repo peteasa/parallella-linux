@@ -464,7 +464,7 @@ static void elink_disable_chip_elink(struct elink_device *elink,
 		return;
 
 	regs_phys = (core_phys | E_REG_BASE) & PAGE_MASK;
-	regs = ioremap_nocache(regs_phys, PAGE_SIZE);
+	regs = ioremap(regs_phys, PAGE_SIZE);
 	WARN_ON(!regs);
 	if (!regs)
 		return;
@@ -560,7 +560,7 @@ static void array_enable_clock_gating(struct elink_device *elink,
 				continue;
 
 			paddr = (core | E_REG_BASE) & PAGE_MASK;
-			core_mem = ioremap_nocache(paddr, PAGE_SIZE);
+			core_mem = ioremap(paddr, PAGE_SIZE);
 			WARN_ON(!core_mem);
 			if (!core_mem)
 				continue;
@@ -607,7 +607,7 @@ static int configure_chip_tx_divider(struct elink_device *elink,
 		return err;
 
 	regs_phys = (core_phys | E_REG_BASE) & PAGE_MASK;
-	regs = ioremap_nocache(regs_phys, PAGE_SIZE);
+	regs = ioremap(regs_phys, PAGE_SIZE);
 	offset = E_REG_LINKCFG & ~(PAGE_MASK);
 	WARN_ON(!regs);
 	if (!regs)
@@ -2644,8 +2644,8 @@ static struct elink_device *elink_of_probe(struct platform_device *pdev)
 		return ERR_PTR(-ENOMEM);
 	}
 
-	elink->regs = devm_ioremap_nocache(&pdev->dev, elink->regs_start,
-					   elink->regs_size);
+	elink->regs = devm_ioremap(&pdev->dev, elink->regs_start,
+				   elink->regs_size);
 	if (!elink->regs) {
 		dev_err(&pdev->dev, "Mapping eLink registers failed.\n");
 		return ERR_PTR(-ENOMEM);
