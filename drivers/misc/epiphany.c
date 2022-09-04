@@ -1200,7 +1200,7 @@ static int mesh_pfn_to_phys_pfn(struct elink_device *elink, unsigned long pfn,
 	return -EINVAL;
 }
 
-static int epiphany_vm_fault(struct vm_fault *vmf)
+static vm_fault_t epiphany_vm_fault(struct vm_fault *vmf)
 {
 	unsigned long phys_pfn;
 	struct elink_device *elink = vma_to_elink(vmf->vma);
@@ -1223,7 +1223,7 @@ static int epiphany_vm_fault(struct vm_fault *vmf)
 	if (ret)
 		goto out_unlock;
 
-	ret = vm_insert_pfn(vmf->vma, vmf->address, phys_pfn);
+	ret = vmf_insert_pfn(vmf->vma, vmf->address, phys_pfn);
 
 out_unlock:
 	mutex_unlock(&epiphany.driver_lock);
