@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * MPU3050 gyroscope driver
  *
@@ -29,7 +30,8 @@
 
 #include "mpu3050.h"
 
-#define MPU3050_CHIP_ID		0x69
+#define MPU3050_CHIP_ID		0x68
+#define MPU3050_CHIP_ID_MASK	0x7E
 
 /*
  * Register map: anything suffixed *_H is a big-endian high byte and always
@@ -541,7 +543,7 @@ static irqreturn_t mpu3050_trigger_handler(int irq, void *p)
 				toread = bytes_per_datum;
 				offset = 1;
 				/* Put in some dummy value */
-				fifo_values[0] = 0xAAAA;
+				fifo_values[0] = cpu_to_be16(0xAAAA);
 			}
 
 			ret = regmap_bulk_read(mpu3050->map,
@@ -740,7 +742,6 @@ static const struct attribute_group mpu3050_attribute_group = {
 };
 
 static const struct iio_info mpu3050_info = {
-	.driver_module = THIS_MODULE,
 	.read_raw = mpu3050_read_raw,
 	.write_raw = mpu3050_write_raw,
 	.attrs = &mpu3050_attribute_group,
@@ -863,7 +864,7 @@ static int mpu3050_power_up(struct mpu3050 *mpu3050)
 		dev_err(mpu3050->dev, "error setting power mode\n");
 		return ret;
 	}
-	msleep(10);
+	usleep_range(10000, 20000);
 
 	return 0;
 }
@@ -1030,7 +1031,6 @@ static int mpu3050_drdy_trigger_set_state(struct iio_trigger *trig,
 }
 
 static const struct iio_trigger_ops mpu3050_trigger_ops = {
-	.owner = THIS_MODULE,
 	.set_trigger_state = mpu3050_drdy_trigger_set_state,
 };
 
@@ -1149,8 +1149,7 @@ int mpu3050_common_probe(struct device *dev,
 	mpu3050->divisor = 99;
 
 	/* Read the mounting matrix, if present */
-	ret = of_iio_read_mount_matrix(dev, "mount-matrix",
-				       &mpu3050->orientation);
+	ret = iio_read_mount_matrix(dev, "mount-matrix", &mpu3050->orientation);
 	if (ret)
 		return ret;
 
@@ -1176,8 +1175,9 @@ int mpu3050_common_probe(struct device *dev,
 		goto err_power_down;
 	}
 
-	if (val != MPU3050_CHIP_ID) {
-		dev_err(dev, "unsupported chip id %02x\n", (u8)val);
+	if ((val & MPU3050_CHIP_ID_MASK) != MPU3050_CHIP_ID) {
+		dev_err(dev, "unsupported chip id %02x\n",
+				(u8)(val & MPU3050_CHIP_ID_MASK));
 		ret = -ENODEV;
 		goto err_power_down;
 	}
@@ -1196,7 +1196,6 @@ int mpu3050_common_probe(struct device *dev,
 	if (ret)
 		goto err_power_down;
 
-	indio_dev->dev.parent = dev;
 	indio_dev->channels = mpu3050_channels;
 	indio_dev->num_channels = ARRAY_SIZE(mpu3050_channels);
 	indio_dev->info = &mpu3050_info;

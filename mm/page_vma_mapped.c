@@ -21,7 +21,29 @@ static bool map_pte(struct page_vma_mapped_walk *pvmw)
 			if (!is_swap_pte(*pvmw->pte))
 				return false;
 		} else {
-			if (!pte_present(*pvmw->pte))
+			/*
+			 * We get here when we are trying to unmap a private
+			 * device page from the process address space. Such
+			 * page is not CPU accessible and thus is mapped as
+			 * a special swap entry, nonetheless it still does
+			 * count as a valid regular mapping for the page (and
+			 * is accounted as such in page maps count).
+			 *
+			 * So handle this special case as if it was a normal
+			 * page mapping ie lock CPU page table and returns
+			 * true.
+			 *
+			 * For more details on device private memory see HMM
+			 * (include/linux/hmm.h or mm/hmm.c).
+			 */
+			if (is_swap_pte(*pvmw->pte)) {
+				swp_entry_t entry;
+
+				/* Handle un-addressable ZONE_DEVICE memory */
+				entry = pte_to_swp_entry(*pvmw->pte);
+				if (!is_device_private_entry(entry))
+					return false;
+			} else if (!pte_present(*pvmw->pte))
 				return false;
 		}
 	}
@@ -30,10 +52,41 @@ static bool map_pte(struct page_vma_mapped_walk *pvmw)
 	return true;
 }
 
+static inline bool pfn_is_match(struct page *page, unsigned long pfn)
+{
+	unsigned long page_pfn = page_to_pfn(page);
+
+	/* normal page and hugetlbfs page */
+	if (!PageTransCompound(page) || PageHuge(page))
+		return page_pfn == pfn;
+
+	/* THP can be referenced by any subpage */
+	return pfn >= page_pfn && pfn - page_pfn < thp_nr_pages(page);
+}
+
+/**
+ * check_pte - check if @pvmw->page is mapped at the @pvmw->pte
+ *
+ * page_vma_mapped_walk() found a place where @pvmw->page is *potentially*
+ * mapped. check_pte() has to validate this.
+ *
+ * @pvmw->pte may point to empty PTE, swap PTE or PTE pointing to arbitrary
+ * page.
+ *
+ * If PVMW_MIGRATION flag is set, returns true if @pvmw->pte contains migration
+ * entry that points to @pvmw->page or any subpage in case of THP.
+ *
+ * If PVMW_MIGRATION flag is not set, returns true if @pvmw->pte points to
+ * @pvmw->page or any subpage in case of THP.
+ *
+ * Otherwise, return false.
+ *
+ */
 static bool check_pte(struct page_vma_mapped_walk *pvmw)
 {
+	unsigned long pfn;
+
 	if (pvmw->flags & PVMW_MIGRATION) {
-#ifdef CONFIG_MIGRATION
 		swp_entry_t entry;
 		if (!is_swap_pte(*pvmw->pte))
 			return false;
@@ -41,38 +94,25 @@ static bool check_pte(struct page_vma_mapped_walk *pvmw)
 
 		if (!is_migration_entry(entry))
 			return false;
-		if (migration_entry_to_page(entry) - pvmw->page >=
-				hpage_nr_pages(pvmw->page)) {
+
+		pfn = migration_entry_to_pfn(entry);
+	} else if (is_swap_pte(*pvmw->pte)) {
+		swp_entry_t entry;
+
+		/* Handle un-addressable ZONE_DEVICE memory */
+		entry = pte_to_swp_entry(*pvmw->pte);
+		if (!is_device_private_entry(entry))
 			return false;
-		}
-		if (migration_entry_to_page(entry) < pvmw->page)
-			return false;
-#else
-		WARN_ON_ONCE(1);
-#endif
+
+		pfn = device_private_entry_to_pfn(entry);
 	} else {
-		if (is_swap_pte(*pvmw->pte)) {
-			swp_entry_t entry;
-
-			entry = pte_to_swp_entry(*pvmw->pte);
-			if (is_device_private_entry(entry) &&
-			    device_private_entry_to_page(entry) == pvmw->page)
-				return true;
-		}
-
 		if (!pte_present(*pvmw->pte))
 			return false;
 
-		/* THP can be referenced by any subpage */
-		if (pte_page(*pvmw->pte) - pvmw->page >=
-				hpage_nr_pages(pvmw->page)) {
-			return false;
-		}
-		if (pte_page(*pvmw->pte) < pvmw->page)
-			return false;
+		pfn = pte_pfn(*pvmw->pte);
 	}
 
-	return true;
+	return pfn_is_match(pvmw->page, pfn);
 }
 
 /**
@@ -117,8 +157,7 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
 
 	if (unlikely(PageHuge(pvmw->page))) {
 		/* when pud is not present, pte will be NULL */
-		pvmw->pte = huge_pte_offset(mm, pvmw->address,
-					    PAGE_SIZE << compound_order(page));
+		pvmw->pte = huge_pte_offset(mm, pvmw->address, page_size(page));
 		if (!pvmw->pte)
 			return false;
 
@@ -188,7 +227,7 @@ next_pte:
 			if (pvmw->address >= pvmw->vma->vm_end ||
 			    pvmw->address >=
 					__vma_address(pvmw->page, pvmw->vma) +
-					hpage_nr_pages(pvmw->page) * PAGE_SIZE)
+					thp_size(pvmw->page))
 				return not_found(pvmw);
 			/* Did we cross page table boundary? */
 			if (pvmw->address % PMD_SIZE == 0) {
@@ -229,7 +268,7 @@ int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma)
 	unsigned long start, end;
 
 	start = __vma_address(page, vma);
-	end = start + PAGE_SIZE * (hpage_nr_pages(page) - 1);
+	end = start + thp_size(page) - PAGE_SIZE;
 
 	if (unlikely(end < vma->vm_start || start >= vma->vm_end))
 		return 0;

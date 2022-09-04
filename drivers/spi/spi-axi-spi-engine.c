@@ -1,9 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * SPI-Engine SPI controller driver
  * Copyright 2015 Analog Devices Inc.
  *  Author: Lars-Peter Clausen <lars@metafoo.de>
- *
- * Licensed under the GPL-2.
  */
 
 #include <linux/clk.h>
@@ -93,6 +92,8 @@ struct spi_engine_program {
 struct spi_engine {
 	struct clk *clk;
 	struct clk *ref_clk;
+
+	struct spi_master *master;
 
 	spinlock_t lock;
 
@@ -208,10 +209,21 @@ static void spi_engine_gen_xfer(struct spi_engine_program *p, bool dry,
 }
 
 static void spi_engine_gen_sleep(struct spi_engine_program *p, bool dry,
-	struct spi_engine *spi_engine, unsigned int clk_div, unsigned int delay)
+	struct spi_engine *spi_engine, unsigned int clk_div,
+	struct spi_transfer *xfer)
 {
 	unsigned int spi_clk = clk_get_rate(spi_engine->ref_clk);
 	unsigned int t;
+	int delay;
+
+	if (xfer->delay_usecs) {
+		delay = xfer->delay_usecs;
+	} else {
+		delay = spi_delay_to_ns(&xfer->delay, xfer);
+		if (delay < 0)
+			return;
+		delay /= 1000;
+	}
 
 	if (delay == 0)
 		return;
@@ -277,8 +289,7 @@ static int spi_engine_compile_message(struct spi_engine *spi_engine,
 
 		spi_engine_update_xfer_len(spi_engine, xfer);
 		spi_engine_gen_xfer(p, dry, xfer);
-		spi_engine_gen_sleep(p, dry, spi_engine, clk_div,
-			xfer->delay_usecs);
+		spi_engine_gen_sleep(p, dry, spi_engine, clk_div, xfer);
 
 		cs_change = xfer->cs_change;
 		if (list_is_last(&xfer->transfer_list, &msg->transfers))
@@ -468,8 +479,9 @@ static void spi_engine_write_buff(struct spi_engine *spi_engine, uint8_t m)
 
 	for (i = 0; i < (m * bytes_len); i += bytes_len) {
 		for (j = 0; j < bytes_len; j++)
-			val |= spi_engine->tx_buf[j] << (word_len - 8 * (j + 1));
+			val |= spi_engine->tx_buf[i + j] << (word_len - 8 * (j + 1));
 		writel_relaxed(val, addr);
+		val = 0;
 	}
 
 	spi_engine->tx_buf += i;
@@ -576,11 +588,10 @@ static irqreturn_t spi_engine_irq(int irq, void *devid)
 	return IRQ_HANDLED;
 }
 
-static void spi_engine_timeout(unsigned long data)
+static void spi_engine_timeout(struct timer_list *t)
 {
-	struct spi_master *master = (struct spi_master *)data;
-	struct spi_engine *spi_engine = spi_master_get_devdata(master);
-
+	struct spi_engine *spi_engine = from_timer(spi_engine, t, watchdog_timer);
+	struct spi_master *master = spi_engine->master;
 
 	spin_lock(&spi_engine->lock);
 	if (spi_engine->msg) {
@@ -648,7 +659,6 @@ static int spi_engine_probe(struct platform_device *pdev)
 	struct spi_engine *spi_engine;
 	struct spi_master *master;
 	unsigned int version;
-	struct resource *res;
 	int irq;
 	int ret;
 
@@ -665,25 +675,9 @@ static int spi_engine_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	spi_master_set_devdata(master, spi_engine);
+	spi_engine->master = master;
 
 	spin_lock_init(&spi_engine->lock);
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	spi_engine->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(spi_engine->base)) {
-		ret = PTR_ERR(spi_engine->base);
-		goto err_put_master;
-	}
-
-	version = readl(spi_engine->base + SPI_ENGINE_REG_VERSION);
-	if (SPI_ENGINE_VERSION_MAJOR(version) != 1) {
-		dev_err(&pdev->dev, "Unsupported peripheral version %u.%u.%c\n",
-			SPI_ENGINE_VERSION_MAJOR(version),
-			SPI_ENGINE_VERSION_MINOR(version),
-			SPI_ENGINE_VERSION_PATCH(version));
-		ret = -ENODEV;
-		goto err_put_master;
-	}
 
 	spi_engine->clk = devm_clk_get(&pdev->dev, "s_axi_aclk");
 	if (IS_ERR(spi_engine->clk)) {
@@ -705,6 +699,22 @@ static int spi_engine_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_clk_disable;
 
+	spi_engine->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(spi_engine->base)) {
+		ret = PTR_ERR(spi_engine->base);
+		goto err_ref_clk_disable;
+	}
+
+	version = readl(spi_engine->base + SPI_ENGINE_REG_VERSION);
+	if (SPI_ENGINE_VERSION_MAJOR(version) != 1) {
+		dev_err(&pdev->dev, "Unsupported peripheral version %u.%u.%c\n",
+			SPI_ENGINE_VERSION_MAJOR(version),
+			SPI_ENGINE_VERSION_MINOR(version),
+			SPI_ENGINE_VERSION_PATCH(version));
+		ret = -ENODEV;
+		goto err_ref_clk_disable;
+	}
+
 	writel_relaxed(0x00, spi_engine->base + SPI_ENGINE_REG_RESET);
 	writel_relaxed(0xff, spi_engine->base + SPI_ENGINE_REG_INT_PENDING);
 	writel_relaxed(0x00, spi_engine->base + SPI_ENGINE_REG_INT_ENABLE);
@@ -719,8 +729,7 @@ static int spi_engine_probe(struct platform_device *pdev)
 	master->transfer_one_message = spi_engine_transfer_one_message;
 	master->num_chipselect = 8;
 
-	setup_timer(&spi_engine->watchdog_timer, spi_engine_timeout,
-		(unsigned long)master);
+	timer_setup(&spi_engine->watchdog_timer, spi_engine_timeout, 0);
 
 	ret = spi_register_master(master);
 	if (ret)
@@ -742,13 +751,15 @@ err_put_master:
 
 static int spi_engine_remove(struct platform_device *pdev)
 {
-	struct spi_master *master = platform_get_drvdata(pdev);
+	struct spi_master *master = spi_master_get(platform_get_drvdata(pdev));
 	struct spi_engine *spi_engine = spi_master_get_devdata(master);
 	int irq = platform_get_irq(pdev, 0);
 
 	spi_unregister_master(master);
 
 	free_irq(irq, master);
+
+	spi_master_put(master);
 
 	writel_relaxed(0xff, spi_engine->base + SPI_ENGINE_REG_INT_PENDING);
 	writel_relaxed(0x00, spi_engine->base + SPI_ENGINE_REG_INT_ENABLE);

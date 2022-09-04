@@ -7,6 +7,7 @@
  */
 
 #include "zynqmp-zcu102-revB.dts"
+#include <dt-bindings/interrupt-controller/irq.h>
 
 &i2c1 {
 	i2c-mux@75 {
@@ -41,8 +42,8 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x9c400000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 109 0>;
-			clocks = <&clk 71>;
+			interrupts = <0 109 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&zynqmp_clk 71>;
 
 			adi,channels {
 				#size-cells = <0>;
@@ -63,8 +64,8 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x9c420000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 108 0>;
-			clocks = <&clk 71>;
+			interrupts = <0 108 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&zynqmp_clk 71>;
 
 			adi,channels {
 				#size-cells = <0>;

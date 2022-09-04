@@ -2,7 +2,7 @@
 /*
  * dts file for Xilinx ZynqMP ZCU104
  *
- * (C) Copyright 2017 - 2018, Xilinx, Inc.
+ * (C) Copyright 2017 - 2020, Xilinx, Inc.
  *
  * Michal Simek <michal.simek@xilinx.com>
  */
@@ -35,11 +35,35 @@
 	chosen {
 		bootargs = "earlycon";
 		stdout-path = "serial0:115200n8";
+		xlnx,eeprom = &eeprom;
 	};
 
 	memory@0 {
 		device_type = "memory";
 		reg = <0x0 0x0 0x0 0x80000000>;
+	};
+
+	ina226 {
+		compatible = "iio-hwmon";
+		io-channels = <&u183 0>, <&u183 1>, <&u183 2>, <&u183 3>;
+	};
+
+	clock_8t49n287_5: clk125 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <125000000>;
+	};
+
+	clock_8t49n287_2: clk26 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+	};
+
+	clock_8t49n287_3: clk27 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <27000000>;
 	};
 };
 
@@ -53,18 +77,50 @@
 	status = "okay";
 };
 
+&fpd_dma_chan1 {
+	status = "okay";
+};
+
+&fpd_dma_chan2 {
+	status = "okay";
+};
+
+&fpd_dma_chan3 {
+	status = "okay";
+};
+
+&fpd_dma_chan4 {
+	status = "okay";
+};
+
+&fpd_dma_chan5 {
+	status = "okay";
+};
+
+&fpd_dma_chan6 {
+	status = "okay";
+};
+
+&fpd_dma_chan7 {
+	status = "okay";
+};
+
+&fpd_dma_chan8 {
+	status = "okay";
+};
+
 &gem3 {
 	status = "okay";
 	phy-handle = <&phy0>;
 	phy-mode = "rgmii-id";
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_gem3_default>;
-	phy0: phy@c {
+	phy0: ethernet-phy@c {
 		reg = <0xc>;
 		ti,rx-internal-delay = <0x8>;
 		ti,tx-internal-delay = <0xa>;
 		ti,fifo-depth = <0x1>;
-		ti,rxctrl-strap-worka;
+		ti,dp83867-rxctrl-strap-quirk;
 	};
 };
 
@@ -91,17 +147,17 @@
 		gpio-controller;
 		#gpio-cells = <2>;
 		/*
-		  * IRQ not connected
-		  * Lines:
-		  * 0 - IRPS5401_ALERT_B
-		  * 1 - HDMI_8T49N241_INT_ALM
-		  * 2 - MAX6643_OT_B
-		  * 3 - MAX6643_FANFAIL_B
-		  * 5 - IIC_MUX_RESET_B
-		  * 6 - GEM3_EXP_RESET_B
-		  * 7 - FMC_LPC_PRSNT_M2C_B
-		  * 4, 10 - 17 - not connected
-		  */
+		 * IRQ not connected
+		 * Lines:
+		 * 0 - IRPS5401_ALERT_B
+		 * 1 - HDMI_8T49N241_INT_ALM
+		 * 2 - MAX6643_OT_B
+		 * 3 - MAX6643_FANFAIL_B
+		 * 5 - IIC_MUX_RESET_B
+		 * 6 - GEM3_EXP_RESET_B
+		 * 7 - FMC_LPC_PRSNT_M2C_B
+		 * 4, 10 - 17 - not connected
+		 */
 	};
 
 	/* Another connection to this bus via PL i2c via PCA9306 - u45 */
@@ -144,15 +200,13 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			reg = <2>;
-			irps5401_43: irps54012@43 { /* IRPS5401 - u175 */
-				#clock-cells = <0>;
+			irps5401_43: irps5401@43 { /* IRPS5401 - u175 */
 				compatible = "infineon,irps5401";
-				reg = <0x43>;
+				reg = <0x43>; /* pmbus / i2c 0x13 */
 			};
-			irps5401_4d: irps54012@4d { /* IRPS5401 - u180 */
-				#clock-cells = <0>;
+			irps5401_44: irps5401@44 { /* IRPS5401 - u180 */
 				compatible = "infineon,irps5401";
-				reg = <0x4d>;
+				reg = <0x44>; /* pmbus / i2c 0x14 */
 			};
 		};
 
@@ -160,8 +214,9 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			reg = <3>;
-			ina226@40 { /* u183 */
+			u183: ina226@40 { /* u183 */
 				compatible = "ti,ina226";
+				#io-channel-cells = <1>;
 				reg = <0x40>;
 				shunt-resistor = <5000>;
 			};
@@ -195,7 +250,7 @@
 		conf {
 			groups = "can1_6_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			drive-strength = <12>;
 		};
 
@@ -220,7 +275,7 @@
 			groups = "i2c1_4_grp";
 			bias-pull-up;
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			drive-strength = <12>;
 		};
 	};
@@ -234,7 +289,7 @@
 		conf {
 			groups = "gpio0_16_grp", "gpio0_17_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			drive-strength = <12>;
 		};
 	};
@@ -248,7 +303,7 @@
 		conf {
 			groups = "ethernet3_0_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			drive-strength = <12>;
 		};
 
@@ -274,7 +329,7 @@
 		conf-mdio {
 			groups = "mdio3_0_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			bias-disable;
 		};
 	};
@@ -288,7 +343,7 @@
 		conf {
 			groups = "sdio1_0_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			bias-disable;
 			drive-strength = <12>;
 		};
@@ -303,7 +358,7 @@
 			bias-high-impedance;
 			bias-pull-up;
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 		};
 	};
 
@@ -316,7 +371,7 @@
 		conf {
 			groups = "uart0_4_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			drive-strength = <12>;
 		};
 
@@ -340,7 +395,7 @@
 		conf {
 			groups = "uart1_5_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			drive-strength = <12>;
 		};
 
@@ -364,7 +419,7 @@
 		conf {
 			groups = "usb0_0_grp";
 			slew-rate = <SLEW_RATE_SLOW>;
-			io-standard = <IO_STANDARD_LVCMOS18>;
+			power-source = <IO_STANDARD_LVCMOS18>;
 			drive-strength = <12>;
 		};
 
@@ -384,26 +439,26 @@
 &qspi {
 	status = "okay";
 	flash@0 {
-		compatible = "m25p80"; /* n25q512a 128MiB */
+		compatible = "m25p80", "jedec,spi-nor"; /* n25q512a 128MiB */
 		#address-cells = <1>;
 		#size-cells = <1>;
 		reg = <0x0>;
 		spi-tx-bus-width = <1>;
 		spi-rx-bus-width = <4>;
 		spi-max-frequency = <108000000>; /* Based on DC1 spec */
-		partition@qspi-fsbl-uboot { /* for testing purpose */
+		partition@0 { /* for testing purpose */
 			label = "qspi-fsbl-uboot";
 			reg = <0x0 0x100000>;
 		};
-		partition@qspi-linux { /* for testing purpose */
+		partition@100000 { /* for testing purpose */
 			label = "qspi-linux";
 			reg = <0x100000 0x500000>;
 		};
-		partition@qspi-device-tree { /* for testing purpose */
+		partition@600000 { /* for testing purpose */
 			label = "qspi-device-tree";
 			reg = <0x600000 0x20000>;
 		};
-		partition@qspi-rootfs { /* for testing purpose */
+		partition@620000 { /* for testing purpose */
 			label = "qspi-rootfs";
 			reg = <0x620000 0x5E0000>;
 		};
@@ -412,6 +467,13 @@
 
 &rtc {
 	status = "okay";
+};
+
+&psgtr {
+	status = "okay";
+	/* nc, sata, usb3, dp */
+	clocks = <&clock_8t49n287_5>, <&clock_8t49n287_2>, <&clock_8t49n287_3>;
+	clock-names = "ref1", "ref2", "ref3";
 };
 
 &sata {
@@ -426,7 +488,7 @@
 	ceva,p1-burst-params = /bits/ 8 <0x13 0x08 0x4A 0x06>;
 	ceva,p1-retry-params = /bits/ 16 <0x96A4 0x3FFC>;
 	phy-names = "sata-phy";
-	phys = <&lane3 PHY_TYPE_SATA 1 1 125000000>;
+	phys = <&psgtr 3 PHY_TYPE_SATA 1 1>;
 };
 
 /* SD1 with level shifter */
@@ -435,12 +497,8 @@
 	no-1-8-v;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_sdhci1_default>;
-	xlnx,mio_bank = <1>;
+	xlnx,mio-bank = <1>;
 	disable-wp;
-};
-
-&serdes {
-	status = "okay";
 };
 
 &uart0 {
@@ -467,7 +525,7 @@
 	dr_mode = "host";
 	snps,usb3_lpm_capable;
 	phy-names = "usb3-phy";
-	phys = <&lane2 PHY_TYPE_USB3 0 2 26000000>;
+	phys = <&psgtr 2 PHY_TYPE_USB3 0 2>;
 	maximum-speed = "super-speed";
 };
 
@@ -487,10 +545,15 @@
 	status = "okay";
 };
 
+&zynqmp_dpdma {
+	status = "okay";
+};
+
 &zynqmp_dpsub {
 	status = "okay";
 	phy-names = "dp-phy0", "dp-phy1";
-	phys = <&lane1 PHY_TYPE_DP 0 3 27000000>, <&lane0 PHY_TYPE_DP 1 3 27000000>;
+	phys = <&psgtr 1 PHY_TYPE_DP 0 3>,
+	       <&psgtr 0 PHY_TYPE_DP 1 3>;
 };
 
 &zynqmp_dp_snd_pcm0 {
@@ -506,9 +569,5 @@
 };
 
 &zynqmp_dp_snd_codec0 {
-	status = "okay";
-};
-
-&xlnx_dpdma {
 	status = "okay";
 };

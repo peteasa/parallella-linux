@@ -1,12 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Ettus Research E310
+ * Link: https://www.ettus.com/all-products/e310/
  *
- * Copyright (C) 2018 Analog Devices Inc.
+ * hdl_project: <usrpe31x>
+ * board_revision: <>
  *
- * Licensed under the GPL-2.
+ * Copyright (C) 2018-2019 Analog Devices Inc.
  */
 /dts-v1/;
-/include/ "zynq.dtsi"
+#include "zynq.dtsi"
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/irq.h>
@@ -28,7 +31,6 @@
 	};
 
 	chosen {
-		linux,stdout-path = "serial0:115200n8";
 		stdout-path = "serial0:115200n8";
 	};
 
@@ -135,7 +137,7 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c400000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 57 0>;
+			interrupts = <0 57 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
 
 			adi,channels {
@@ -156,7 +158,7 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c420000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 56 0>;
+			interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
 
 			adi,channels {

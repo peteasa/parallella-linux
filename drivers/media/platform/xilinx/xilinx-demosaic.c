@@ -26,11 +26,11 @@
 #define XDEMOSAIC_HEIGHT			(0x18)
 #define XDEMOSAIC_INPUT_BAYER_FORMAT		(0x28)
 
-#define XDEMOSAIC_MIN_HEIGHT	(32)
-#define XDEMOSAIC_MAX_HEIGHT	(2160)
+#define XDEMOSAIC_MIN_HEIGHT	(64)
+#define XDEMOSAIC_MAX_HEIGHT	(4320)
 #define XDEMOSAIC_DEF_HEIGHT	(720)
-#define XDEMOSAIC_MIN_WIDTH	(32)
-#define XDEMOSAIC_MAX_WIDTH	(3840)
+#define XDEMOSAIC_MIN_WIDTH	(64)
+#define XDEMOSAIC_MAX_WIDTH	(8192)
 #define XDEMOSAIC_DEF_WIDTH	(1280)
 
 #define XDEMOSAIC_RESET_DEASSERT	(0)
@@ -54,6 +54,8 @@ struct xdmsc_dev {
 
 	enum xdmsc_bayer_format bayer_fmt;
 	struct gpio_desc *rst_gpio;
+	u32 max_width;
+	u32 max_height;
 };
 
 static inline u32 xdmsc_read(struct xdmsc_dev *xdmsc, u32 reg)
@@ -88,15 +90,22 @@ static struct v4l2_mbus_framefmt
 			struct v4l2_subdev_pad_config *cfg,
 			unsigned int pad, u32 which)
 {
+	struct v4l2_mbus_framefmt *get_fmt;
+
 	switch (which) {
 	case V4L2_SUBDEV_FORMAT_TRY:
-		return v4l2_subdev_get_try_format(&xdmsc->xvip.subdev,
-								cfg, pad);
+		get_fmt = v4l2_subdev_get_try_format(&xdmsc->xvip.subdev,
+						     cfg, pad);
+		break;
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
-		return &xdmsc->formats[pad];
+		get_fmt = &xdmsc->formats[pad];
+		break;
 	default:
-		return NULL;
+		get_fmt = NULL;
+		break;
 	}
+
+	return get_fmt;
 }
 
 static int xdmsc_s_stream(struct v4l2_subdev *subdev, int enable)
@@ -132,8 +141,14 @@ static int xdmsc_get_format(struct v4l2_subdev *subdev,
 			    struct v4l2_subdev_format *fmt)
 {
 	struct xdmsc_dev *xdmsc = to_xdmsc(subdev);
+	struct v4l2_mbus_framefmt *get_fmt;
 
-	fmt->format = *__xdmsc_get_pad_format(xdmsc, cfg, fmt->pad, fmt->which);
+	get_fmt = __xdmsc_get_pad_format(xdmsc, cfg, fmt->pad, fmt->which);
+	if (!get_fmt)
+		return -EINVAL;
+
+	fmt->format = *get_fmt;
+
 	return 0;
 }
 
@@ -142,15 +157,27 @@ xdmsc_is_format_bayer(struct xdmsc_dev *xdmsc, u32 code)
 {
 	switch (code) {
 	case MEDIA_BUS_FMT_SRGGB8_1X8:
+	case MEDIA_BUS_FMT_SRGGB10_1X10:
+	case MEDIA_BUS_FMT_SRGGB12_1X12:
+	case MEDIA_BUS_FMT_SRGGB16_1X16:
 		xdmsc->bayer_fmt = XDEMOSAIC_RGGB;
 		break;
 	case MEDIA_BUS_FMT_SGRBG8_1X8:
+	case MEDIA_BUS_FMT_SGRBG10_1X10:
+	case MEDIA_BUS_FMT_SGRBG12_1X12:
+	case MEDIA_BUS_FMT_SGRBG16_1X16:
 		xdmsc->bayer_fmt = XDEMOSAIC_GRBG;
 		break;
 	case MEDIA_BUS_FMT_SGBRG8_1X8:
+	case MEDIA_BUS_FMT_SGBRG10_1X10:
+	case MEDIA_BUS_FMT_SGBRG12_1X12:
+	case MEDIA_BUS_FMT_SGBRG16_1X16:
 		xdmsc->bayer_fmt = XDEMOSAIC_GBRG;
 		break;
 	case MEDIA_BUS_FMT_SBGGR8_1X8:
+	case MEDIA_BUS_FMT_SBGGR10_1X10:
+	case MEDIA_BUS_FMT_SBGGR12_1X12:
+	case MEDIA_BUS_FMT_SBGGR16_1X16:
 		xdmsc->bayer_fmt = XDEMOSAIC_BGGR;
 		break;
 	default:
@@ -168,15 +195,21 @@ static int xdmsc_set_format(struct v4l2_subdev *subdev,
 	struct v4l2_mbus_framefmt *__format;
 
 	__format = __xdmsc_get_pad_format(xdmsc, cfg, fmt->pad, fmt->which);
+	if (!__format)
+		return -EINVAL;
+
 	*__format = fmt->format;
 
 	__format->width = clamp_t(unsigned int, fmt->format.width,
-				XDEMOSAIC_MIN_WIDTH, XDEMOSAIC_MAX_WIDTH);
+				  XDEMOSAIC_MIN_WIDTH, xdmsc->max_width);
 	__format->height = clamp_t(unsigned int, fmt->format.height,
-				XDEMOSAIC_MIN_HEIGHT, XDEMOSAIC_MAX_HEIGHT);
+				   XDEMOSAIC_MIN_HEIGHT, xdmsc->max_height);
 
 	if (fmt->pad == XVIP_PAD_SOURCE) {
-		if (__format->code != MEDIA_BUS_FMT_RBG888_1X24) {
+		if (__format->code != MEDIA_BUS_FMT_RBG888_1X24 &&
+		    __format->code != MEDIA_BUS_FMT_RBG101010_1X30 &&
+		    __format->code != MEDIA_BUS_FMT_RBG121212_1X36 &&
+		    __format->code != MEDIA_BUS_FMT_RBG161616_1X48) {
 			dev_dbg(xdmsc->xvip.dev,
 				"%s : Unsupported source media bus code format",
 				__func__);
@@ -244,6 +277,28 @@ static int xdmsc_parse_of(struct xdmsc_dev *xdmsc)
 	u32 port_id = 0;
 	int rval;
 
+	rval = of_property_read_u32(node, "xlnx,max-height",
+				    &xdmsc->max_height);
+	if (rval < 0) {
+		dev_err(dev, "missing xlnx,max-height property!");
+		return -EINVAL;
+	} else if (xdmsc->max_height > XDEMOSAIC_MAX_HEIGHT ||
+		 xdmsc->max_height < XDEMOSAIC_MIN_HEIGHT) {
+		dev_err(dev, "Invalid height in dt");
+		return -EINVAL;
+	}
+
+	rval = of_property_read_u32(node, "xlnx,max-width",
+				    &xdmsc->max_width);
+	if (rval < 0) {
+		dev_err(dev, "missing xlnx,max-width property!");
+		return -EINVAL;
+	} else if (xdmsc->max_width > XDEMOSAIC_MAX_WIDTH ||
+		 xdmsc->max_width < XDEMOSAIC_MIN_WIDTH) {
+		dev_err(dev, "Invalid width in dt");
+		return -EINVAL;
+	}
+
 	ports = of_get_child_by_name(node, "ports");
 	if (!ports)
 		ports = node;
@@ -287,6 +342,8 @@ static int xdmsc_probe(struct platform_device *pdev)
 	if (rval < 0)
 		return rval;
 	rval = xvip_init_resources(&xdmsc->xvip);
+	if (rval)
+		return -EIO;
 
 	/* Reset Demosaic IP */
 	gpiod_set_value_cansleep(xdmsc->rst_gpio,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -22,9 +23,16 @@ struct iio_kfifo {
 #define iio_to_kfifo(r) container_of(r, struct iio_kfifo, buffer)
 
 static inline int __iio_allocate_kfifo(struct iio_kfifo *buf,
-				int bytes_per_datum, int length)
+			size_t bytes_per_datum, unsigned int length)
 {
 	if ((length == 0) || (bytes_per_datum == 0))
+		return -EINVAL;
+
+	/*
+	 * Make sure we don't overflow an unsigned int after kfifo rounds up to
+	 * the next power of 2.
+	 */
+	if (roundup_pow_of_two(length) > UINT_MAX / bytes_per_datum)
 		return -EINVAL;
 
 	return __kfifo_alloc((struct __kfifo *)&buf->kf, length,
@@ -67,7 +75,7 @@ static int iio_set_bytes_per_datum_kfifo(struct iio_buffer *r, size_t bpd)
 	return 0;
 }
 
-static int iio_set_length_kfifo(struct iio_buffer *r, int length)
+static int iio_set_length_kfifo(struct iio_buffer *r, unsigned int length)
 {
 	/* Avoid an invalid state */
 	if (length < 2)
@@ -221,16 +229,6 @@ static void devm_iio_kfifo_release(struct device *dev, void *res)
 	iio_kfifo_free(*(struct iio_buffer **)res);
 }
 
-static int devm_iio_kfifo_match(struct device *dev, void *res, void *data)
-{
-	struct iio_buffer **r = res;
-
-	if (WARN_ON(!r || !*r))
-		return 0;
-
-	return *r == data;
-}
-
 /**
  * devm_iio_fifo_allocate - Resource-managed iio_kfifo_allocate()
  * @dev:		Device to allocate kfifo buffer for
@@ -257,17 +255,5 @@ struct iio_buffer *devm_iio_kfifo_allocate(struct device *dev)
 	return r;
 }
 EXPORT_SYMBOL(devm_iio_kfifo_allocate);
-
-/**
- * devm_iio_fifo_free - Resource-managed iio_kfifo_free()
- * @dev:		Device the buffer belongs to
- * @r:			The buffer associated with the device
- */
-void devm_iio_kfifo_free(struct device *dev, struct iio_buffer *r)
-{
-	WARN_ON(devres_release(dev, devm_iio_kfifo_release,
-			       devm_iio_kfifo_match, r));
-}
-EXPORT_SYMBOL(devm_iio_kfifo_free);
 
 MODULE_LICENSE("GPL");

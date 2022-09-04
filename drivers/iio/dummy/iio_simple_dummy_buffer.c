@@ -1,9 +1,6 @@
-/**
+// SPDX-License-Identifier: GPL-2.0-only
+/*
  * Copyright (c) 2011 Jonathan Cameron
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
  *
  * Buffer handling elements of industrial I/O reference driver.
  * Uses the kfifo buffer.
@@ -168,7 +165,7 @@ error_ret:
 
 /**
  * iio_simple_dummy_unconfigure_buffer() - release buffer resources
- * @indo_dev: device instance state
+ * @indio_dev: device instance state
  */
 void iio_simple_dummy_unconfigure_buffer(struct iio_dev *indio_dev)
 {

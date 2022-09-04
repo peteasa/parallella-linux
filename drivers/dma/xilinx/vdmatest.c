@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * XILINX VDMA Engine test client driver
  *
@@ -595,16 +596,19 @@ static int xilinx_vdmatest_probe(struct platform_device *pdev)
 		return err;
 	}
 
-	chan = dma_request_slave_channel(&pdev->dev, "vdma0");
+	chan = dma_request_chan(&pdev->dev, "vdma0");
 	if (IS_ERR(chan)) {
-		pr_err("xilinx_vdmatest: No Tx channel\n");
-		return PTR_ERR(chan);
+		err = PTR_ERR(chan);
+		if (err != -EPROBE_DEFER)
+			pr_err("xilinx_vdmatest: No Tx channel\n");
+		return err;
 	}
 
-	rx_chan = dma_request_slave_channel(&pdev->dev, "vdma1");
+	rx_chan = dma_request_chan(&pdev->dev, "vdma1");
 	if (IS_ERR(rx_chan)) {
 		err = PTR_ERR(rx_chan);
-		pr_err("xilinx_vdmatest: No Rx channel\n");
+		if (err != -EPROBE_DEFER)
+			pr_err("xilinx_vdmatest: No Rx channel\n");
 		goto free_tx;
 	}
 
@@ -634,6 +638,7 @@ static int xilinx_vdmatest_remove(struct platform_device *pdev)
 		xilinx_vdmatest_cleanup_channel(dtc);
 		pr_info("xilinx_vdmatest: dropped channel %s\n",
 			dma_chan_name(chan));
+		dmaengine_terminate_async(chan);
 		dma_release_channel(chan);
 	}
 	return 0;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Xilinx Video DMA
  *
@@ -6,10 +7,6 @@
  *
  * Contacts: Hyun Kwon <hyun.kwon@xilinx.com>
  *           Laurent Pinchart <laurent.pinchart@ideasonboard.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #include <linux/dma/xilinx_dma.h>
@@ -19,6 +16,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/xilinx-v4l2-controls.h>
 
 #include <media/v4l2-dev.h>
 #include <media/v4l2-fh.h>
@@ -33,7 +31,7 @@
 #define XVIP_DMA_DEF_FORMAT		V4L2_PIX_FMT_YUYV
 #define XVIP_DMA_DEF_WIDTH		1920
 #define XVIP_DMA_DEF_HEIGHT		1080
-
+#define XVIP_DMA_DEF_WIDTH_ALIGN	2
 /* Minimum and maximum widths are expressed in bytes */
 #define XVIP_DMA_MIN_WIDTH		1U
 #define XVIP_DMA_MAX_WIDTH		65535U
@@ -64,7 +62,6 @@ static int xvip_dma_verify_format(struct xvip_dma *dma)
 	struct v4l2_subdev_format fmt;
 	struct v4l2_subdev *subdev;
 	int ret;
-	int width, height;
 
 	subdev = xvip_dma_remote_subdev(&dma->pad, &fmt.pad);
 	if (!subdev)
@@ -78,15 +75,12 @@ static int xvip_dma_verify_format(struct xvip_dma *dma)
 	if (dma->fmtinfo->code != fmt.format.code)
 		return -EINVAL;
 
-	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
-		width = dma->format.fmt.pix_mp.width;
-		height = dma->format.fmt.pix_mp.height;
-	} else {
-		width = dma->format.fmt.pix.width;
-		height = dma->format.fmt.pix.height;
-	}
-
-	if (width != fmt.format.width || height != fmt.format.height)
+	/*
+	 * Crop rectangle contains format resolution by default, and crop
+	 * rectangle if s_selection is executed.
+	 */
+	if (dma->r.width != fmt.format.width ||
+	    dma->r.height != fmt.format.height)
 		return -EINVAL;
 
 	return 0;
@@ -96,92 +90,6 @@ static int xvip_dma_verify_format(struct xvip_dma *dma)
  * Pipeline Stream Management
  */
 
-/* Get the sink pad internally connected to a source pad in the given entity. */
-static struct media_pad *xvip_get_entity_sink(struct media_entity *entity,
-					      struct media_pad *source)
-{
-	unsigned int i;
-
-	/* The source pad can be NULL when the entity has no source pad. Return
-	 * the first pad in that case, guaranteed to be a sink pad.
-	 */
-	if (!source)
-		return &entity->pads[0];
-
-	/* Iterates through the pads to find a connected sink pad. */
-	for (i = 0; i < entity->num_pads; ++i) {
-		struct media_pad *sink = &entity->pads[i];
-
-		if (!(sink->flags & MEDIA_PAD_FL_SINK))
-			continue;
-
-		if (sink == source)
-			continue;
-
-		if (media_entity_has_route(entity, sink->index, source->index))
-			return sink;
-	}
-
-	return NULL;
-}
-
-/**
- * xvip_pipeline_start_stop - Start ot stop streaming on a pipeline
- * @xdev: Composite video device
- * @dma: xvip dma
- * @start: Start (when true) or stop (when false) the pipeline
- *
- * Walk the entities chain starting @dma and start or stop all of them
- *
- * Return: 0 if successful, or the return value of the failed video::s_stream
- * operation otherwise.
- */
-static int xvip_pipeline_start_stop(struct xvip_composite_device *xdev,
-				    struct xvip_dma *dma, bool start)
-{
-	struct media_entity *entity;
-	struct media_pad *pad;
-	struct v4l2_subdev *subdev;
-	bool is_streaming;
-	int ret;
-
-	entity = &dma->video.entity;
-	pad = NULL;
-
-	while (1) {
-		pad = xvip_get_entity_sink(entity, pad);
-		if (!pad)
-			break;
-
-		if (!(pad->flags & MEDIA_PAD_FL_SINK))
-			break;
-
-		pad = media_entity_remote_pad(pad);
-		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
-			break;
-
-		entity = pad->entity;
-		subdev = media_entity_to_v4l2_subdev(entity);
-
-		is_streaming = xvip_subdev_set_streaming(xdev, subdev, start);
-
-		/*
-		 * start or stop the subdev only once in case if they are
-		 * shared between sub-graphs
-		 */
-		if (start != is_streaming) {
-			ret = v4l2_subdev_call(subdev, video, s_stream,
-					       start);
-			if (start && ret < 0 && ret != -ENOIOCTLCMD) {
-				dev_err(xdev->dev, "s_stream is failed on subdev\n");
-				xvip_subdev_set_streaming(xdev, subdev, !start);
-				return ret;
-			}
-		}
-	}
-
-	return 0;
-}
 
 /**
  * xvip_pipeline_set_stream - Enable/disable streaming on a pipeline
@@ -212,7 +120,6 @@ static int xvip_pipeline_start_stop(struct xvip_composite_device *xdev,
 static int xvip_pipeline_set_stream(struct xvip_pipeline *pipe, bool on)
 {
 	struct xvip_composite_device *xdev;
-	struct xvip_dma *dma;
 	int ret = 0;
 
 	mutex_lock(&pipe->lock);
@@ -220,22 +127,14 @@ static int xvip_pipeline_set_stream(struct xvip_pipeline *pipe, bool on)
 
 	if (on) {
 		if (pipe->stream_count == pipe->num_dmas - 1) {
-			/*
-			 * This will iterate the DMAs and the stream-on of
-			 * subdevs may not be sequential due to multiple
-			 * sub-graph path
-			 */
-			list_for_each_entry(dma, &xdev->dmas, list) {
-				ret = xvip_pipeline_start_stop(xdev, dma, true);
-				if (ret < 0)
-					goto done;
-			}
+			ret = xvip_graph_pipeline_start_stop(xdev, pipe, true);
+			if (ret < 0)
+				goto done;
 		}
 		pipe->stream_count++;
 	} else {
 		if (--pipe->stream_count == 0)
-			list_for_each_entry(dma, &xdev->dmas, list)
-				xvip_pipeline_start_stop(xdev, dma, false);
+			xvip_graph_pipeline_start_stop(xdev, pipe, false);
 	}
 
 done:
@@ -272,11 +171,10 @@ static int xvip_pipeline_validate(struct xvip_pipeline *pipe,
 
 		dma = to_xvip_dma(media_entity_to_video_device(entity));
 
-		if (dma->pad.flags & MEDIA_PAD_FL_SINK) {
+		if (dma->pad.flags & MEDIA_PAD_FL_SINK)
 			num_outputs++;
-		} else {
+		else
 			num_inputs++;
-		}
 	}
 
 	mutex_unlock(&mdev->graph_mutex);
@@ -425,7 +323,7 @@ xvip_dma_queue_setup(struct vb2_queue *vq,
 		     unsigned int sizes[], struct device *alloc_devs[])
 {
 	struct xvip_dma *dma = vb2_get_drv_priv(vq);
-	u8 i;
+	unsigned int i;
 	int sizeimage;
 
 	/* Multi planar case: Make sure the image size is large enough */
@@ -480,10 +378,11 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 	struct xvip_dma_buffer *buf = to_xvip_dma_buffer(vbuf);
 	struct dma_async_tx_descriptor *desc;
 	dma_addr_t addr = vb2_dma_contig_plane_dma_addr(vb, 0);
-	u32 flags;
+	u32 flags = 0;
 	u32 luma_size;
 	u32 padding_factor_nume, padding_factor_deno, bpl_nume, bpl_deno;
 	u32 fid = ~0;
+	u32 bpl;
 
 	if (dma->queue.type == V4L2_BUF_TYPE_VIDEO_CAPTURE ||
 	    dma->queue.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
@@ -507,8 +406,11 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 	 */
 	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
 		struct v4l2_pix_format_mplane *pix_mp;
+		size_t size;
 
 		pix_mp = &dma->format.fmt.pix_mp;
+		bpl = pix_mp->plane_fmt[0].bytesperline;
+
 		xilinx_xdma_v4l2_config(dma->dma, pix_mp->pixelformat);
 		xvip_width_padding_factor(pix_mp->pixelformat,
 					  &padding_factor_nume,
@@ -516,12 +418,14 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 		xvip_bpl_scaling_factor(pix_mp->pixelformat, &bpl_nume,
 					&bpl_deno);
 		dma->xt.frame_size = dma->fmtinfo->num_planes;
-		dma->sgl[0].size = (pix_mp->width * dma->fmtinfo->bpl_factor *
-				    padding_factor_nume * bpl_nume) /
-				    (padding_factor_deno * bpl_deno);
-		dma->sgl[0].icg = pix_mp->plane_fmt[0].bytesperline -
-							dma->sgl[0].size;
-		dma->xt.numf = pix_mp->height;
+
+		size = ((size_t)dma->r.width * dma->fmtinfo->bpl_factor *
+			padding_factor_nume * bpl_nume) /
+			((size_t)padding_factor_deno * bpl_deno);
+		dma->sgl[0].size = size;
+
+		dma->sgl[0].icg = bpl - dma->sgl[0].size;
+		dma->xt.numf = dma->r.height;
 
 		/*
 		 * dst_icg is the number of bytes to jump after last luma addr
@@ -530,14 +434,14 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 
 		/* Handling contiguous data with mplanes */
 		if (dma->fmtinfo->buffers == 1) {
-			dma->sgl[0].dst_icg = 0;
+			dma->sgl[0].dst_icg = (size_t)bpl *
+					      (pix_mp->height - dma->r.height);
 		} else {
 			/* Handling non-contiguous data with mplanes */
 			if (dma->fmtinfo->buffers == 2) {
 				dma_addr_t chroma_addr =
 					vb2_dma_contig_plane_dma_addr(vb, 1);
-				luma_size = pix_mp->plane_fmt[0].bytesperline *
-					    dma->xt.numf;
+				luma_size = bpl * dma->xt.numf;
 				if (chroma_addr > addr)
 					dma->sgl[0].dst_icg = chroma_addr -
 							      addr - luma_size;
@@ -545,8 +449,11 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 		}
 	} else {
 		struct v4l2_pix_format *pix;
+		size_t size;
+		size_t dst_icg;
 
 		pix = &dma->format.fmt.pix;
+		bpl = pix->bytesperline;
 		xilinx_xdma_v4l2_config(dma->dma, pix->pixelformat);
 		xvip_width_padding_factor(pix->pixelformat,
 					  &padding_factor_nume,
@@ -554,12 +461,15 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 		xvip_bpl_scaling_factor(pix->pixelformat, &bpl_nume,
 					&bpl_deno);
 		dma->xt.frame_size = dma->fmtinfo->num_planes;
-		dma->sgl[0].size = (pix->width * dma->fmtinfo->bpl_factor *
-				    padding_factor_nume * bpl_nume) /
-				    (padding_factor_deno * bpl_deno);
-		dma->sgl[0].icg = pix->bytesperline - dma->sgl[0].size;
-		dma->xt.numf = pix->height;
+		size = ((size_t)dma->r.width * dma->fmtinfo->bpl_factor *
+			padding_factor_nume * bpl_nume) /
+			((size_t)padding_factor_deno * bpl_deno);
+		dma->sgl[0].size = size;
+		dma->sgl[0].icg = bpl - dma->sgl[0].size;
+		dma->xt.numf = dma->r.height;
 		dma->sgl[0].dst_icg = 0;
+		dst_icg = (size_t)bpl * (pix->height - dma->r.height);
+		dma->sgl[0].dst_icg = dst_icg;
 	}
 
 	desc = dmaengine_prep_interleaved_dma(dma->dma, &dma->xt, flags);
@@ -585,6 +495,13 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
 	list_add_tail(&buf->queue, &dma->queued_bufs);
 	spin_unlock_irq(&dma->queued_lock);
 
+	/*
+	 * Low latency capture: Give descriptor callback at start of
+	 * processing the descriptor
+	 */
+	if (dma->low_latency_cap)
+		xilinx_xdma_set_earlycb(dma->dma, desc,
+					EARLY_CALLBACK_START_DESC);
 	dmaengine_submit(desc);
 
 	if (vb2_is_streaming(&dma->queue))
@@ -630,8 +547,20 @@ static int xvip_dma_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 	/* Start the DMA engine. This must be done before starting the blocks
 	 * in the pipeline to avoid DMA synchronization issues.
+	 * We dont't want to start DMA in case of low latency capture mode,
+	 * applications will start DMA using S_CTRL at later point of time.
 	 */
-	dma_async_issue_pending(dma->dma);
+	if (!dma->low_latency_cap) {
+		dma_async_issue_pending(dma->dma);
+	} else {
+		/* For low latency capture, return the first buffer early
+		 * so that consumer can initialize until we start DMA.
+		 */
+		buf = list_first_entry(&dma->queued_bufs,
+				       struct xvip_dma_buffer, queue);
+		xvip_dma_complete(buf);
+		buf->desc->callback = NULL;
+	}
 
 	/* Start the pipeline. */
 	ret = xvip_pipeline_set_stream(pipe, true);
@@ -701,29 +630,107 @@ xvip_dma_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
 	struct v4l2_fh *vfh = file->private_data;
 	struct xvip_dma *dma = to_xvip_dma(vfh->vdev);
 
-	cap->capabilities = V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING
-			  | dma->xdev->v4l2_caps;
+	cap->capabilities = dma->xdev->v4l2_caps | V4L2_CAP_STREAMING |
+			    V4L2_CAP_DEVICE_CAPS;
 
-	cap->device_caps = V4L2_CAP_STREAMING;
-	switch (dma->queue.type) {
-	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
-		cap->device_caps |= V4L2_CAP_VIDEO_CAPTURE_MPLANE;
-		break;
-	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
-		cap->device_caps |= V4L2_CAP_VIDEO_CAPTURE;
-		break;
-	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
-		cap->device_caps |= V4L2_CAP_VIDEO_OUTPUT_MPLANE;
-		break;
-	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
-		cap->device_caps |= V4L2_CAP_VIDEO_OUTPUT;
-		break;
+	strscpy((char *)cap->driver, "xilinx-vipp", sizeof(cap->driver));
+	strscpy((char *)cap->card, (char *)dma->video.name, sizeof(cap->card));
+	snprintf((char *)cap->bus_info, sizeof(cap->bus_info),
+		 "platform:%pOFn:%u", dma->xdev->dev->of_node, dma->port);
+
+	return 0;
+}
+
+static int xvip_xdma_enum_fmt(struct xvip_dma *dma, struct v4l2_fmtdesc *f,
+			      struct v4l2_subdev_format *v4l_fmt)
+{
+	const struct xvip_video_format *fmt;
+	int ret;
+	u32 i, fmt_cnt, *fmts;
+
+	ret = xilinx_xdma_get_v4l2_vid_fmts(dma->dma, &fmt_cnt, &fmts);
+	if (ret)
+		return ret;
+
+	/* Has media pad value changed? */
+	if (v4l_fmt->format.code != dma->remote_subdev_med_bus ||
+	    !dma->remote_subdev_med_bus) {
+		/* Re-generate legal list of fourcc codes */
+		dma->poss_v4l2_fmt_cnt = 0;
+		dma->remote_subdev_med_bus = v4l_fmt->format.code;
+
+		if (!dma->poss_v4l2_fmts) {
+			dma->poss_v4l2_fmts =
+				devm_kzalloc(&dma->video.dev,
+					     sizeof(u32) * fmt_cnt,
+					     GFP_KERNEL);
+			if (!dma->poss_v4l2_fmts)
+				return -ENOMEM;
+		}
+
+		for (i = 0; i < fmt_cnt; i++) {
+			fmt = xvip_get_format_by_fourcc(fmts[i]);
+			if (IS_ERR(fmt))
+				return PTR_ERR(fmt);
+
+			if (fmt->code != dma->remote_subdev_med_bus)
+				continue;
+
+			dma->poss_v4l2_fmts[dma->poss_v4l2_fmt_cnt++] =	fmts[i];
+		}
 	}
 
-	strlcpy(cap->driver, "xilinx-vipp", sizeof(cap->driver));
-	strlcpy(cap->card, dma->video.name, sizeof(cap->card));
-	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s:%u",
-		 dma->xdev->dev->of_node->name, dma->port);
+	/* Return err if index is greater than count of legal values */
+	if (f->index >= dma->poss_v4l2_fmt_cnt)
+		return -EINVAL;
+
+	/* Else return pix format in table */
+	fmt = xvip_get_format_by_fourcc(dma->poss_v4l2_fmts[f->index]);
+	if (IS_ERR(fmt))
+		return PTR_ERR(fmt);
+
+	f->pixelformat = fmt->fourcc;
+
+	return 0;
+}
+
+static int
+xvip_dma_enum_input(struct file *file, void *priv, struct v4l2_input *i)
+{
+	struct v4l2_fh *vfh = file->private_data;
+	struct xvip_dma *dma = to_xvip_dma(vfh->vdev);
+	struct v4l2_subdev *subdev;
+
+	if (i->index > 0)
+		return -EINVAL;
+
+	subdev = xvip_dma_remote_subdev(&dma->pad, NULL);
+	if (!subdev)
+		return -EPIPE;
+
+	/*
+	 * FIXME: right now only camera input type is handled.
+	 * There should be mechanism to distinguish other types of
+	 * input like V4L2_INPUT_TYPE_TUNER and V4L2_INPUT_TYPE_TOUCH.
+	 */
+	i->type = V4L2_INPUT_TYPE_CAMERA;
+	strlcpy((char *)i->name, (char *)subdev->name, sizeof(i->name));
+
+	return 0;
+}
+
+static int
+xvip_dma_get_input(struct file *file, void *fh, unsigned int *i)
+{
+	*i = 0;
+	return 0;
+}
+
+static int
+xvip_dma_set_input(struct file *file, void *fh, unsigned int i)
+{
+	if (i > 0)
+		return -EINVAL;
 
 	return 0;
 }
@@ -740,75 +747,42 @@ xvip_dma_enum_format(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 	struct xvip_dma *dma = to_xvip_dma(vfh->vdev);
 	struct v4l2_subdev *subdev;
 	struct v4l2_subdev_format v4l_fmt;
-	int err, ret;
 	const struct xvip_video_format *fmt;
+	int err, ret;
 
-	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
-		/* establish media pad format */
-		subdev = xvip_dma_remote_subdev(&dma->pad, &v4l_fmt.pad);
-		if (!subdev)
-			return -EPIPE;
+	/* Establish media pad format */
+	subdev = xvip_dma_remote_subdev(&dma->pad, &v4l_fmt.pad);
+	if (!subdev)
+		return -EPIPE;
 
-		v4l_fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-		ret = v4l2_subdev_call(subdev, pad, get_fmt, NULL, &v4l_fmt);
-		if (ret < 0)
-			return ret == -ENOIOCTLCMD ? -EINVAL : ret;
+	v4l_fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+	ret = v4l2_subdev_call(subdev, pad, get_fmt, NULL, &v4l_fmt);
+	if (ret < 0)
+		return ret == -ENOIOCTLCMD ? -EINVAL : ret;
 
-		/* has media pad value changed? */
-		if (v4l_fmt.format.code != dma->remote_subdev_med_bus ||
-		    !dma->remote_subdev_med_bus) {
-			u32 i, fmt_cnt, *fmts;
-			/* re-generate legal list of fourcc codes */
-			dma->poss_v4l2_fmt_cnt = 0;
-			dma->remote_subdev_med_bus = v4l_fmt.format.code;
-			err = xilinx_xdma_get_v4l2_vid_fmts(dma->dma, &fmt_cnt,
-							    &fmts);
-			if (err)
-				return err;
-			if (!dma->poss_v4l2_fmts) {
-				dma->poss_v4l2_fmts =
-					devm_kzalloc(&dma->video.dev,
-						     sizeof(u32) * fmt_cnt,
-						     GFP_KERNEL);
-				if (!dma->poss_v4l2_fmts)
-					return -ENOMEM;
-			}
-			for (i = 0; i < fmt_cnt; i++) {
-				fmt = xvip_get_format_by_fourcc(fmts[i]);
-				if (IS_ERR(fmt))
-					return PTR_ERR(fmt);
+	/*
+	 * In case of frmbuf DMA, this will invoke frambuf driver specific APIs
+	 * to enumerate formats otherwise return the pix format corresponding
+	 * to subdev's media bus format. This kind of separation would be
+	 * helpful for clean up and upstreaming.
+	 */
+	err = xvip_xdma_enum_fmt(dma, f, &v4l_fmt);
+	if (!err)
+		return err;
 
-				if (fmt->code != dma->remote_subdev_med_bus)
-					continue;
-
-				dma->poss_v4l2_fmts[dma->poss_v4l2_fmt_cnt++] =
-									fmts[i];
-			}
-		}
-
-		/* Return err if index is greater than count of legal values */
-		if (f->index >= dma->poss_v4l2_fmt_cnt)
-			return -EINVAL;
-
-		/* Else return pix format in table */
-		fmt = xvip_get_format_by_fourcc(dma->poss_v4l2_fmts[f->index]);
-		if (IS_ERR(fmt))
-			return PTR_ERR(fmt);
-
-		f->pixelformat = fmt->fourcc;
-		strlcpy(f->description, fmt->description,
-			sizeof(f->description));
-
-		return 0;
-	}
-
-	/* Single plane formats */
+	/*
+	 * This logic will just return one pix format based on subdev's
+	 * media bus format
+	 */
 	if (f->index > 0)
 		return -EINVAL;
 
-	f->pixelformat = dma->format.fmt.pix.pixelformat;
-	strlcpy(f->description, dma->fmtinfo->description,
-		sizeof(f->description));
+	fmt = xvip_get_format_by_code(v4l_fmt.format.code);
+	if (IS_ERR(fmt))
+		return PTR_ERR(fmt);
+
+	f->pixelformat = fmt->fourcc;
+
 	return 0;
 }
 
@@ -837,7 +811,6 @@ __xvip_dma_try_format(struct xvip_dma *dma,
 	unsigned int min_bpl;
 	unsigned int max_bpl;
 	unsigned int width;
-	unsigned int align;
 	unsigned int bpl;
 	unsigned int i, hsub, vsub, plane_width, plane_height;
 	unsigned int fourcc;
@@ -889,9 +862,8 @@ __xvip_dma_try_format(struct xvip_dma *dma,
 	 * the minimum and maximum values, clamp the requested width and convert
 	 * it back to pixels.
 	 */
-	align = lcm(dma->align, info->bpp >> 3);
-	min_width = roundup(XVIP_DMA_MIN_WIDTH, align);
-	max_width = rounddown(XVIP_DMA_MAX_WIDTH, align);
+	min_width = roundup(XVIP_DMA_MIN_WIDTH, dma->width_align);
+	max_width = rounddown(XVIP_DMA_MAX_WIDTH, dma->width_align);
 
 	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
 		struct v4l2_pix_format_mplane *pix_mp;
@@ -900,13 +872,12 @@ __xvip_dma_try_format(struct xvip_dma *dma,
 		pix_mp = &format->fmt.pix_mp;
 		plane_fmt = pix_mp->plane_fmt;
 		pix_mp->field = dma->format.fmt.pix_mp.field;
-		width = rounddown(pix_mp->width * info->bpl_factor, align);
+		width = rounddown(pix_mp->width * info->bpl_factor,
+				  dma->width_align);
 		pix_mp->width = clamp(width, min_width, max_width) /
 				info->bpl_factor;
 		pix_mp->height = clamp(pix_mp->height, XVIP_DMA_MIN_HEIGHT,
 				       XVIP_DMA_MAX_HEIGHT);
-		if (pix_mp->field == V4L2_FIELD_ALTERNATE)
-			pix_mp->height = pix_mp->height / 2;
 
 		/*
 		 * Clamp the requested bytes per line value. If the maximum
@@ -964,14 +935,12 @@ __xvip_dma_try_format(struct xvip_dma *dma,
 
 		pix = &format->fmt.pix;
 		pix->field = dma->format.fmt.pix.field;
-		width = rounddown(pix->width * info->bpl_factor, align);
+		width = rounddown(pix->width * info->bpl_factor,
+				  dma->width_align);
 		pix->width = clamp(width, min_width, max_width) /
 			     info->bpl_factor;
 		pix->height = clamp(pix->height, XVIP_DMA_MIN_HEIGHT,
 				    XVIP_DMA_MAX_HEIGHT);
-
-		if (pix->field == V4L2_FIELD_ALTERNATE)
-			pix->height = pix->height / 2;
 
 		min_bpl = (pix->width * info->bpl_factor *
 			  padding_factor_nume * bpl_nume) /
@@ -1009,12 +978,122 @@ xvip_dma_set_format(struct file *file, void *fh, struct v4l2_format *format)
 	if (vb2_is_busy(&dma->queue))
 		return -EBUSY;
 
-	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type))
+	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
 		dma->format.fmt.pix_mp = format->fmt.pix_mp;
-	else
+
+		/*
+		 * Save format resolution in crop rectangle. This will be
+		 * updated when s_slection is called.
+		 */
+		dma->r.width = format->fmt.pix_mp.width;
+		dma->r.height = format->fmt.pix_mp.height;
+	} else {
 		dma->format.fmt.pix = format->fmt.pix;
+		dma->r.width = format->fmt.pix.width;
+		dma->r.height = format->fmt.pix.height;
+	}
 
 	dma->fmtinfo = info;
+
+	return 0;
+}
+
+static int
+xvip_dma_g_selection(struct file *file, void *fh, struct v4l2_selection *sel)
+{
+	struct v4l2_fh *vfh = file->private_data;
+	struct xvip_dma *dma = to_xvip_dma(vfh->vdev);
+	u32 width, height;
+	bool crop_frame = false;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_COMPOSE:
+		if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+			return -EINVAL;
+
+		crop_frame = true;
+		break;
+	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+		if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+			return -EINVAL;
+		break;
+	case V4L2_SEL_TGT_CROP:
+		if (sel->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+			return -EINVAL;
+
+		crop_frame = true;
+		break;
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		if (sel->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+			return -EINVAL;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	sel->r.left = 0;
+	sel->r.top = 0;
+
+	if (crop_frame) {
+		sel->r.width = dma->r.width;
+		sel->r.height = dma->r.height;
+	} else {
+		if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
+			width = dma->format.fmt.pix_mp.width;
+			height = dma->format.fmt.pix_mp.height;
+		} else {
+			width = dma->format.fmt.pix.width;
+			height = dma->format.fmt.pix.height;
+		}
+
+		sel->r.width = width;
+		sel->r.height = height;
+	}
+
+	return 0;
+}
+
+static int
+xvip_dma_s_selection(struct file *file, void *fh, struct v4l2_selection *sel)
+{
+	struct v4l2_fh *vfh = file->private_data;
+	struct xvip_dma *dma = to_xvip_dma(vfh->vdev);
+	u32 width, height;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_COMPOSE:
+		/* COMPOSE target is only valid for capture buftype */
+		if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+			return -EINVAL;
+		break;
+	case V4L2_SEL_TGT_CROP:
+		/* CROP target is only valid for output buftype */
+		if (sel->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+			return -EINVAL;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
+		width = dma->format.fmt.pix_mp.width;
+		height = dma->format.fmt.pix_mp.height;
+	} else {
+		width = dma->format.fmt.pix.width;
+		height = dma->format.fmt.pix.height;
+	}
+
+	if (sel->r.width > width || sel->r.height > height ||
+	    sel->r.top != 0 || sel->r.left != 0)
+		return -EINVAL;
+
+	sel->r.width = rounddown(max(XVIP_DMA_MIN_WIDTH, sel->r.width),
+				 dma->width_align);
+	sel->r.height = max(XVIP_DMA_MIN_HEIGHT, sel->r.height);
+	dma->r.width = sel->r.width;
+	dma->r.height = sel->r.height;
 
 	return 0;
 }
@@ -1022,16 +1101,21 @@ xvip_dma_set_format(struct file *file, void *fh, struct v4l2_format *format)
 static const struct v4l2_ioctl_ops xvip_dma_ioctl_ops = {
 	.vidioc_querycap		= xvip_dma_querycap,
 	.vidioc_enum_fmt_vid_cap	= xvip_dma_enum_format,
-	.vidioc_enum_fmt_vid_cap_mplane	= xvip_dma_enum_format,
+	.vidioc_enum_fmt_vid_out	= xvip_dma_enum_format,
 	.vidioc_g_fmt_vid_cap		= xvip_dma_get_format,
 	.vidioc_g_fmt_vid_cap_mplane	= xvip_dma_get_format,
 	.vidioc_g_fmt_vid_out		= xvip_dma_get_format,
+	.vidioc_g_fmt_vid_out_mplane	= xvip_dma_get_format,
 	.vidioc_s_fmt_vid_cap		= xvip_dma_set_format,
 	.vidioc_s_fmt_vid_cap_mplane	= xvip_dma_set_format,
 	.vidioc_s_fmt_vid_out		= xvip_dma_set_format,
+	.vidioc_s_fmt_vid_out_mplane	= xvip_dma_set_format,
 	.vidioc_try_fmt_vid_cap		= xvip_dma_try_format,
 	.vidioc_try_fmt_vid_cap_mplane	= xvip_dma_try_format,
 	.vidioc_try_fmt_vid_out		= xvip_dma_try_format,
+	.vidioc_try_fmt_vid_out_mplane	= xvip_dma_try_format,
+	.vidioc_s_selection		= xvip_dma_s_selection,
+	.vidioc_g_selection		= xvip_dma_g_selection,
 	.vidioc_reqbufs			= vb2_ioctl_reqbufs,
 	.vidioc_querybuf		= vb2_ioctl_querybuf,
 	.vidioc_qbuf			= vb2_ioctl_qbuf,
@@ -1040,6 +1124,99 @@ static const struct v4l2_ioctl_ops xvip_dma_ioctl_ops = {
 	.vidioc_expbuf			= vb2_ioctl_expbuf,
 	.vidioc_streamon		= vb2_ioctl_streamon,
 	.vidioc_streamoff		= vb2_ioctl_streamoff,
+	.vidioc_enum_input	= &xvip_dma_enum_input,
+	.vidioc_g_input		= &xvip_dma_get_input,
+	.vidioc_s_input		= &xvip_dma_set_input,
+};
+
+/* -----------------------------------------------------------------------------
+ * V4L2 controls
+ */
+
+static int xvip_dma_s_ctrl(struct v4l2_ctrl *ctl)
+{
+	struct xvip_dma *dma = container_of(ctl->handler, struct xvip_dma,
+					    ctrl_handler);
+	int ret = 0;
+
+	switch (ctl->id)  {
+	case V4L2_CID_XILINX_LOW_LATENCY:
+		if (ctl->val == XVIP_LOW_LATENCY_ENABLE) {
+			if (vb2_is_busy(&dma->queue))
+				return -EBUSY;
+
+			dma->low_latency_cap = true;
+			/*
+			 * Don't use auto-restart for low latency
+			 * to avoid extra one frame delay between
+			 * programming and actual writing of data
+			 */
+			xilinx_xdma_set_mode(dma->dma, DEFAULT);
+		} else if (ctl->val == XVIP_LOW_LATENCY_DISABLE) {
+			if (vb2_is_busy(&dma->queue))
+				return -EBUSY;
+
+			dma->low_latency_cap = false;
+			xilinx_xdma_set_mode(dma->dma, AUTO_RESTART);
+		} else if (ctl->val == XVIP_START_DMA) {
+			/*
+			 * In low latency capture, the driver allows application
+			 * to start dma when queue has buffers. That's why we
+			 * don't check for vb2_is_busy().
+			 */
+			if (dma->low_latency_cap &&
+			    vb2_is_streaming(&dma->queue))
+				dma_async_issue_pending(dma->dma);
+			else
+				ret = -EINVAL;
+		} else {
+			ret = -EINVAL;
+		}
+
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+static int xvip_dma_open(struct file *file)
+{
+	int ret;
+
+	ret = v4l2_fh_open(file);
+	if (ret)
+		return ret;
+
+	/* Disable the low latency mode as default */
+	if (v4l2_fh_is_singular_file(file)) {
+		struct xvip_dma *dma = video_drvdata(file);
+
+		mutex_lock(&dma->lock);
+		dma->low_latency_cap = false;
+		xilinx_xdma_set_mode(dma->dma, AUTO_RESTART);
+		mutex_unlock(&dma->lock);
+	}
+
+	return 0;
+}
+
+static const struct v4l2_ctrl_ops xvip_dma_ctrl_ops = {
+	.s_ctrl = xvip_dma_s_ctrl,
+};
+
+static const struct v4l2_ctrl_config xvip_dma_ctrls[] = {
+	{
+		.ops = &xvip_dma_ctrl_ops,
+		.id = V4L2_CID_XILINX_LOW_LATENCY,
+		.name = "Low Latency Controls",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.min = XVIP_LOW_LATENCY_ENABLE,
+		.max = XVIP_START_DMA,
+		.step = 1,
+		.def = XVIP_LOW_LATENCY_DISABLE,
+	}
 };
 
 /* -----------------------------------------------------------------------------
@@ -1049,7 +1226,7 @@ static const struct v4l2_ioctl_ops xvip_dma_ioctl_ops = {
 static const struct v4l2_file_operations xvip_dma_fops = {
 	.owner		= THIS_MODULE,
 	.unlocked_ioctl	= video_ioctl2,
-	.open		= v4l2_fh_open,
+	.open		= xvip_dma_open,
 	.release	= vb2_fop_release,
 	.poll		= vb2_fop_poll,
 	.mmap		= vb2_fop_mmap,
@@ -1129,18 +1306,52 @@ int xvip_dma_init(struct xvip_composite_device *xdev, struct xvip_dma *dma,
 	if (ret < 0)
 		goto error;
 
+	ret = v4l2_ctrl_handler_init(&dma->ctrl_handler,
+				     ARRAY_SIZE(xvip_dma_ctrls));
+	if (ret < 0) {
+		dev_err(dma->xdev->dev, "failed to initialize V4L2 ctrl\n");
+		goto error;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(xvip_dma_ctrls); i++) {
+		struct v4l2_ctrl *ctrl;
+
+		dev_dbg(dma->xdev->dev, "%d ctrl = 0x%x\n", i,
+			xvip_dma_ctrls[i].id);
+		ctrl = v4l2_ctrl_new_custom(&dma->ctrl_handler,
+					    &xvip_dma_ctrls[i], NULL);
+		if (!ctrl) {
+			dev_err(dma->xdev->dev, "Failed for %s ctrl\n",
+				xvip_dma_ctrls[i].name);
+			goto error;
+		}
+	}
+
+	if (dma->ctrl_handler.error) {
+		dev_err(dma->xdev->dev, "failed to add controls\n");
+		ret = dma->ctrl_handler.error;
+		goto error;
+	}
+
+	ret = v4l2_ctrl_handler_setup(&dma->ctrl_handler);
+	if (ret < 0) {
+		dev_err(dma->xdev->dev, "failed to set controls\n");
+		goto error;
+	}
+
 	/* ... and the video node... */
 	dma->video.fops = &xvip_dma_fops;
 	dma->video.v4l2_dev = &xdev->v4l2_dev;
+	dma->video.v4l2_dev->ctrl_handler = &dma->ctrl_handler;
 	dma->video.queue = &dma->queue;
-	snprintf(dma->video.name, sizeof(dma->video.name), "%s %s %u",
-		 xdev->dev->of_node->name,
+	snprintf(dma->video.name, sizeof(dma->video.name), "%pOFn %s %u",
+		 xdev->dev->of_node,
 		 (type == V4L2_BUF_TYPE_VIDEO_CAPTURE ||
 		  type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 					? "output" : "input",
 		 port);
 
-	dma->video.vfl_type = VFL_TYPE_GRABBER;
+	dma->video.vfl_type = VFL_TYPE_VIDEO;
 	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE ||
 	    type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		dma->video.vfl_dir = VFL_DIR_RX;
@@ -1150,6 +1361,21 @@ int xvip_dma_init(struct xvip_composite_device *xdev, struct xvip_dma *dma,
 	dma->video.release = video_device_release_empty;
 	dma->video.ioctl_ops = &xvip_dma_ioctl_ops;
 	dma->video.lock = &dma->lock;
+	dma->video.device_caps = V4L2_CAP_STREAMING;
+	switch (dma->format.type) {
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+		dma->video.device_caps |= V4L2_CAP_VIDEO_CAPTURE_MPLANE;
+		break;
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
+		dma->video.device_caps |= V4L2_CAP_VIDEO_CAPTURE;
+		break;
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
+		dma->video.device_caps |= V4L2_CAP_VIDEO_OUTPUT_MPLANE;
+		break;
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+		dma->video.device_caps |= V4L2_CAP_VIDEO_OUTPUT;
+		break;
+	}
 
 	video_set_drvdata(&dma->video, dma);
 
@@ -1183,14 +1409,20 @@ int xvip_dma_init(struct xvip_composite_device *xdev, struct xvip_dma *dma,
 	if (IS_ERR(dma->dma)) {
 		ret = PTR_ERR(dma->dma);
 		if (ret != -EPROBE_DEFER)
-			dev_err(dma->xdev->dev,
-				"No Video DMA channel found");
+			dev_err(dma->xdev->dev, "no VDMA channel found\n");
 		goto error;
+	}
+
+	xilinx_xdma_get_width_align(dma->dma, &dma->width_align);
+	if (!dma->width_align) {
+		dev_dbg(dma->xdev->dev,
+			"Using width align %d\n", XVIP_DMA_DEF_WIDTH_ALIGN);
+		dma->width_align = XVIP_DMA_DEF_WIDTH_ALIGN;
 	}
 
 	dma->align = 1 << dma->dma->device->copy_align;
 
-	ret = video_register_device(&dma->video, VFL_TYPE_GRABBER, -1);
+	ret = video_register_device(&dma->video, VFL_TYPE_VIDEO, -1);
 	if (ret < 0) {
 		dev_err(dma->xdev->dev, "failed to register video device\n");
 		goto error;
@@ -1208,9 +1440,10 @@ void xvip_dma_cleanup(struct xvip_dma *dma)
 	if (video_is_registered(&dma->video))
 		video_unregister_device(&dma->video);
 
-	if (!IS_ERR(dma->dma))
+	if (!IS_ERR_OR_NULL(dma->dma))
 		dma_release_channel(dma->dma);
 
+	v4l2_ctrl_handler_free(&dma->ctrl_handler);
 	media_entity_cleanup(&dma->video.entity);
 
 	mutex_destroy(&dma->lock);

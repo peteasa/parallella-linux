@@ -5,7 +5,9 @@
  *
  * Licensed under the GPL-2.
  */
-/include/ "zynq.dtsi"
+#include "zynq.dtsi"
+
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	model = "Analog Devices PlutoSDR Rev.A (Z7010/AD9363)";
@@ -15,7 +17,7 @@
 	};
 
 	chosen {
-		linux,stdout-path = "/amba@0/uart@E0001000";
+		stdout-path = "/amba@0/uart@E0001000";
 	};
 
 	clocks {
@@ -26,14 +28,6 @@
 			clock-accuracy = <200000>; /* 200 ppm (ppb) */
 			clock-output-names = "ad9364_ext_refclk";
 		};
-	};
-
-	usb_phy0: phy0 {
-		compatible = "ulpi-phy";
-		#phy-cells = <0>;
-		reg = <0xe0002000 0x1000>;
-		view-port = <0x0170>;
-		drv-vbus;
 	};
 
 };
@@ -51,19 +45,20 @@
 	xlnx,phy-reset-gpio = <&gpio0 52 0>;
 	dr_mode = "otg";
 	status = "okay";
-	usb-phy = <&usb_phy0>;
 };
 
 &qspi {
 	status = "okay";
 	is-dual = <0>;
 	num-cs = <1>;
+	spi-nor-locking-disable;
+
 	primary_flash: ps7-qspi@0 {
 		#address-cells = <1>;
 		#size-cells = <1>;
 		spi-tx-bus-width = <1>;
 		spi-rx-bus-width = <4>;
-		compatible = "n25q256a", "n25q512a", "jedec,spi-nor"; /* same as S25FL256 */
+		compatible = "jedec,spi-nor";
 		reg = <0x0>;
 		spi-max-frequency = <50000000>;
 		partition@qspi-fsbl-uboot {
@@ -106,7 +101,7 @@
 			compatible = "xlnx,axi-iic-1.02.a", "xlnx,xps-iic-2.00.a";
 			reg = <0x41600000 0x10000>;
 			interrupt-parent = <&intc>;
-			interrupts = <0 59 4>;
+			interrupts = <0 59 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 15>;
 			clock-names = "pclk";
 
@@ -119,7 +114,7 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c400000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 57 0>;
+			interrupts = <0 57 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
 
 			adi,channels {
@@ -128,7 +123,7 @@
 
 				dma-channel@0 {
 					reg = <0>;
-					adi,source-bus-width = <64>;
+					adi,source-bus-width = <32>;
 					adi,source-bus-type = <2>;
 					adi,destination-bus-width = <64>;
 					adi,destination-bus-type = <0>;
@@ -140,7 +135,7 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c420000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 56 0>;
+			interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
 
 			adi,channels {
@@ -151,7 +146,7 @@
 					reg = <0>;
 					adi,source-bus-width = <64>;
 					adi,source-bus-type = <0>;
-					adi,destination-bus-width = <64>;
+					adi,destination-bus-width = <32>;
 					adi,destination-bus-type = <2>;
 				};
 			};
@@ -222,8 +217,7 @@
 		adi,full-port-enable;
 		adi,digital-interface-tune-fir-disable;
 
-		/* Temporary workaround - HDL issue? need to investigate further */
-		adi,digital-interface-tune-skip-mode = <0>; /* SKIP TX */
+		adi,digital-interface-tune-skip-mode = <0>; /* TUNE RX & TX */
 		adi,tx-fb-clock-delay = <0>;
 		adi,tx-data-delay = <9>;
 		adi,swap-ports-enable;

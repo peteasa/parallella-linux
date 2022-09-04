@@ -1,9 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * AD9523 SPI Low Jitter Clock Generator
  *
- * Copyright 2012-2014 Analog Devices Inc.
- *
- * Licensed under the GPL-2.
+ * Copyright 2012 Analog Devices Inc.
  */
 
 #include <linux/device.h>
@@ -288,17 +287,24 @@ struct ad9523_state {
 	struct ad9523_platform_data	*pdata;
 	struct ad9523_outputs		output[AD9523_NUM_CHAN];
 	struct iio_chan_spec		ad9523_channels[AD9523_NUM_CHAN];
+	struct gpio_desc		*pwrdown_gpio;
+	struct gpio_desc		*reset_gpio;
+	struct gpio_desc		*sync_gpio;
 	struct clk_onecell_data		clk_data;
 	struct clk 			*clks[AD9523_NUM_CHAN];
-	struct gpio_desc			*pwrdown_gpio;
-	struct gpio_desc			*reset_gpio;
-	struct gpio_desc			*sync_gpio;
 
 	unsigned long		vcxo_freq;
 	unsigned long		vco_freq;
 	unsigned long		vco_out_freq[AD9523_NUM_CLK_SRC];
 	unsigned char		vco_out_map[AD9523_NUM_CHAN_ALT_CLK_SRC];
 
+	/*
+	 * Lock for accessing device registers. Some operations require
+	 * multiple consecutive R/W operations, during which the device
+	 * shouldn't be interrupted.  The buffers are also shared across
+	 * all operations so need to be protected on stand alone reads and
+	 * writes.
+	 */
 	struct mutex		lock;
 
 	/*
@@ -772,7 +778,6 @@ static const struct iio_info ad9523_info = {
 	.write_raw = &ad9523_write_raw,
 	.debugfs_reg_access = &ad9523_reg_access,
 	.attrs = &ad9523_attribute_group,
-	.driver_module = THIS_MODULE,
 };
 
 static bool ad9523_pll2_valid_div(unsigned int div)
@@ -1004,7 +1009,7 @@ static int ad9523_setup(struct iio_dev *indio_dev)
 
 	ret = ad9523_write(indio_dev, AD9523_SERIAL_PORT_CONFIG,
 			   AD9523_SER_CONF_SOFT_RESET |
-			  ((st->spi->mode & SPI_3WIRE || pdata->spi3wire)? 0 :
+			  ((st->spi->mode & SPI_3WIRE || pdata->spi3wire) ? 0 :
 			  AD9523_SER_CONF_SDO_ACTIVE));
 	if (ret < 0)
 		return ret;
@@ -1215,11 +1220,14 @@ static int ad9523_setup(struct iio_dev *indio_dev)
 		}
 	}
 
-	for_each_clear_bit(i, &active_mask, AD9523_NUM_CHAN)
-		ad9523_write(indio_dev,
+	for_each_clear_bit(i, &active_mask, AD9523_NUM_CHAN) {
+		ret = ad9523_write(indio_dev,
 			     AD9523_CHANNEL_CLOCK_DIST(i),
 			     AD9523_CLK_DIST_DRIVER_MODE(TRISTATE) |
 			     AD9523_CLK_DIST_PWR_DOWN_EN);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = ad9523_write(indio_dev, AD9523_POWER_DOWN_CTRL, 0);
 	if (ret < 0)
@@ -1465,6 +1473,13 @@ struct ad9523_platform_data *ad9523_parse_dt(struct device *dev)
 }
 #endif
 
+static void ad9523_reg_disable(void *data)
+{
+	struct regulator *reg = data;
+
+	regulator_disable(reg);
+}
+
 static int ad9523_probe(struct spi_device *spi)
 {
 	struct ad9523_platform_data *pdata;
@@ -1498,40 +1513,39 @@ static int ad9523_probe(struct spi_device *spi)
 		ret = regulator_enable(st->reg);
 		if (ret)
 			return ret;
+
+		ret = devm_add_action_or_reset(&spi->dev, ad9523_reg_disable,
+					       st->reg);
+		if (ret)
+			return ret;
 	}
 
 	st->pwrdown_gpio = devm_gpiod_get_optional(&spi->dev, "powerdown",
 		GPIOD_OUT_HIGH);
-	if (IS_ERR(st->pwrdown_gpio)) {
-		ret = PTR_ERR(st->pwrdown_gpio);
-		goto error_disable_reg;
-	}
+	if (IS_ERR(st->pwrdown_gpio))
+		return PTR_ERR(st->pwrdown_gpio);
 
-	st->reset_gpio = devm_gpiod_get_optional(&spi->dev, "reset", GPIOD_OUT_LOW);
-	if (IS_ERR(st->reset_gpio)) {
-		ret = PTR_ERR(st->reset_gpio);
-		goto error_disable_reg;
-	}
+	st->reset_gpio = devm_gpiod_get_optional(&spi->dev, "reset",
+		GPIOD_OUT_LOW);
+	if (IS_ERR(st->reset_gpio))
+		return PTR_ERR(st->reset_gpio);
 
 	if (st->reset_gpio) {
 		udelay(1);
-
-		ret = gpiod_direction_output(st->reset_gpio, 1);
+		gpiod_direction_output(st->reset_gpio, 1);
 	}
 
 	mdelay(10);
 
-	st->sync_gpio = devm_gpiod_get_optional(&spi->dev, "sync", GPIOD_OUT_HIGH);
-	if (IS_ERR(st->sync_gpio)) {
-		ret = PTR_ERR(st->sync_gpio);
-		goto error_disable_reg;
-	}
+	st->sync_gpio = devm_gpiod_get_optional(&spi->dev, "sync",
+		GPIOD_OUT_HIGH);
+	if (IS_ERR(st->sync_gpio))
+		return PTR_ERR(st->sync_gpio);
 
 	spi_set_drvdata(spi, indio_dev);
 	st->spi = spi;
 	st->pdata = pdata;
 
-	indio_dev->dev.parent = &spi->dev;
 	indio_dev->name = (pdata->name[0] != 0) ? pdata->name :
 			  spi_get_device_id(spi)->name;
 	indio_dev->info = &ad9523_info;
@@ -1541,34 +1555,9 @@ static int ad9523_probe(struct spi_device *spi)
 
 	ret = ad9523_setup(indio_dev);
 	if (ret < 0)
-		goto error_disable_reg;
+		return ret;
 
-	ret = iio_device_register(indio_dev);
-	if (ret)
-		goto error_disable_reg;
-
-	dev_info(&spi->dev, "probed %s\n", indio_dev->name);
-
-	return 0;
-
-error_disable_reg:
-	if (!IS_ERR(st->reg))
-		regulator_disable(st->reg);
-
-	return ret;
-}
-
-static int ad9523_remove(struct spi_device *spi)
-{
-	struct iio_dev *indio_dev = spi_get_drvdata(spi);
-	struct ad9523_state *st = iio_priv(indio_dev);
-
-	iio_device_unregister(indio_dev);
-
-	if (!IS_ERR(st->reg))
-		regulator_disable(st->reg);
-
-	return 0;
+	return devm_iio_device_register(&spi->dev, indio_dev);
 }
 
 static const struct spi_device_id ad9523_id[] = {
@@ -1582,11 +1571,10 @@ static struct spi_driver ad9523_driver = {
 		.name	= "ad9523",
 	},
 	.probe		= ad9523_probe,
-	.remove		= ad9523_remove,
 	.id_table	= ad9523_id,
 };
 module_spi_driver(ad9523_driver);
 
-MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
+MODULE_AUTHOR("Michael Hennerich <michael.hennerich@analog.com>");
 MODULE_DESCRIPTION("Analog Devices AD9523 CLOCKDIST/PLL");
 MODULE_LICENSE("GPL v2");

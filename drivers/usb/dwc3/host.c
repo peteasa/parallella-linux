@@ -1,45 +1,31 @@
-/**
+// SPDX-License-Identifier: GPL-2.0
+/*
  * host.c - DesignWare USB3 DRD Controller Host Glue
  *
- * Copyright (C) 2011 Texas Instruments Incorporated - http://www.ti.com
+ * Copyright (C) 2011 Texas Instruments Incorporated - https://www.ti.com
  *
  * Authors: Felipe Balbi <balbi@ti.com>,
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2  of
- * the License as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
+#include <linux/acpi.h>
 #include <linux/platform_device.h>
 #include <linux/of_device.h>
-#include <linux/usb/xhci_pdriver.h>
 
 #include "core.h"
-
-void dwc3_host_wakeup_capable(struct device *dev, bool wakeup)
-{
-	dwc3_simple_wakeup_capable(dev, wakeup);
-}
-EXPORT_SYMBOL(dwc3_host_wakeup_capable);
 
 static int dwc3_host_get_irq(struct dwc3 *dwc)
 {
 	struct platform_device	*dwc3_pdev = to_platform_device(dwc->dev);
 	int irq;
 
-	irq = platform_get_irq_byname(dwc3_pdev, "host");
+	irq = platform_get_irq_byname_optional(dwc3_pdev, "host");
 	if (irq > 0)
 		goto out;
 
 	if (irq == -EPROBE_DEFER)
 		goto out;
 
-	irq = platform_get_irq_byname(dwc3_pdev, "dwc_usb3");
+	irq = platform_get_irq_byname_optional(dwc3_pdev, "dwc_usb3");
 	if (irq > 0)
 		goto out;
 
@@ -50,9 +36,6 @@ static int dwc3_host_get_irq(struct dwc3 *dwc)
 	if (irq > 0)
 		goto out;
 
-	if (irq != -EPROBE_DEFER)
-		dev_err(dwc->dev, "missing host IRQ\n");
-
 	if (!irq)
 		irq = -EINVAL;
 
@@ -62,7 +45,7 @@ out:
 
 int dwc3_host_init(struct dwc3 *dwc)
 {
-	struct property_entry	props[4];
+	struct property_entry	props[5];
 	struct platform_device	*xhci;
 	int			ret, irq;
 	struct resource		*res;
@@ -94,15 +77,7 @@ int dwc3_host_init(struct dwc3 *dwc)
 	}
 
 	xhci->dev.parent	= dwc->dev;
-
-	if (IS_ENABLED(CONFIG_OF)) {
-		/* Let OF configure xhci dev's DMA configuration */
-		of_dma_configure(&xhci->dev, dwc->dev->of_node);
-	} else {
-		dma_set_coherent_mask(&xhci->dev, dwc->dev->coherent_dma_mask);
-
-		xhci->dev.archdata	= dwc->dev->archdata;
-	}
+	ACPI_COMPANION_SET(&xhci->dev, ACPI_COMPANION(dwc->dev));
 
 	dwc->xhci = xhci;
 
@@ -110,17 +85,20 @@ int dwc3_host_init(struct dwc3 *dwc)
 						DWC3_XHCI_RESOURCES_NUM);
 	if (ret) {
 		dev_err(dwc->dev, "couldn't add resources to xHCI device\n");
-		goto err1;
+		goto err;
 	}
 
 	memset(props, 0, sizeof(struct property_entry) * ARRAY_SIZE(props));
 
 	if (dwc->usb3_lpm_capable)
-		props[prop_idx++].name = "usb3-lpm-capable";
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("usb3-lpm-capable");
+
+	if (dwc->usb2_lpm_disable)
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("usb2-lpm-disable");
 
 	if (device_property_read_bool(&dwc3_pdev->dev,
 					"snps,xhci-stream-quirk"))
-		props[prop_idx++].name = "xhci-stream-quirk";
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("xhci-stream-quirk");
 
 	/**
 	 * WORKAROUND: dwc3 revisions <=3.00a have a limitation
@@ -131,14 +109,14 @@ int dwc3_host_init(struct dwc3 *dwc)
 	 *
 	 * This following flag tells XHCI to do just that.
 	 */
-	if (dwc->revision <= DWC3_REVISION_300A)
-		props[prop_idx++].name = "quirk-broken-port-ped";
+	if (DWC3_VER_IS_WITHIN(DWC3, ANY, 300A))
+		props[prop_idx++] = PROPERTY_ENTRY_BOOL("quirk-broken-port-ped");
 
 	if (prop_idx) {
 		ret = platform_device_add_properties(xhci, props);
 		if (ret) {
 			dev_err(dwc->dev, "failed to add properties to xHCI\n");
-			goto err1;
+			goto err;
 		}
 	}
 
@@ -148,12 +126,14 @@ int dwc3_host_init(struct dwc3 *dwc)
 			  dev_name(dwc->dev));
 
 	if (dwc->dr_mode == USB_DR_MODE_OTG) {
-		struct usb_phy *phy;
-		phy = usb_get_phy(USB_PHY_TYPE_USB3);
+
+		struct usb_phy *phy = usb_get_phy(USB_PHY_TYPE_USB3);
+
 		if (!IS_ERR(phy)) {
 			if (phy && phy->otg)
 				otg_set_host(phy->otg,
-						(struct usb_bus *)(long)1);
+					     (struct usb_bus *)0xdeadbeef);
+
 			usb_put_phy(phy);
 		}
 	}
@@ -161,25 +141,16 @@ int dwc3_host_init(struct dwc3 *dwc)
 	ret = platform_device_add(xhci);
 	if (ret) {
 		dev_err(dwc->dev, "failed to register xHCI device\n");
-		goto err2;
+		goto err;
 	}
 
 	return 0;
-err2:
-	phy_remove_lookup(dwc->usb2_generic_phy, "usb2-phy",
-			  dev_name(dwc->dev));
-	phy_remove_lookup(dwc->usb3_generic_phy, "usb3-phy",
-			  dev_name(dwc->dev));
-err1:
+err:
 	platform_device_put(xhci);
 	return ret;
 }
 
 void dwc3_host_exit(struct dwc3 *dwc)
 {
-	phy_remove_lookup(dwc->usb2_generic_phy, "usb2-phy",
-			  dev_name(dwc->dev));
-	phy_remove_lookup(dwc->usb3_generic_phy, "usb3-phy",
-			  dev_name(dwc->dev));
 	platform_device_unregister(dwc->xhci);
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /**
  *\file mykonos.c
  *
@@ -1517,6 +1518,18 @@ mykonosErr_t MYKONOS_initSubRegisterTables(mykonosDevice_t *device)
         {
             return retVal;
         }
+    } else {
+	    /*
+	     * In order to use the OBS Framer successfully for some reason
+	     * it's required to enable also the main framer clock.
+	     * Make sure PCLK is set as low as possible because it interacts
+	     * with ORx Framer logic, even though Rx Framer disabled.
+	     */
+	    if ((device->obsRx->obsRxChannelsEnable != MYK_OBS_RXOFF) &&
+		    (device->profilesValid & (ORX_PROFILE_VALID | SNIFF_PROFILE_VALID))) {
+
+		CMB_SPIWriteByte(device->spiSettings, MYKONOS_ADDR_FRAMER_CLK_EN, 0x66);
+	   }
     }
 
     if ((device->obsRx->obsRxChannelsEnable != MYK_OBS_RXOFF) && (device->profilesValid & (ORX_PROFILE_VALID | SNIFF_PROFILE_VALID)))
@@ -13535,7 +13548,7 @@ mykonosErr_t MYKONOS_checkArmState(mykonosDevice_t *device, mykonosArmState_t ar
                 break;
         }
 
-        if (armStateCheck && armStatusMapped)
+        if ((armStateCheck & armStatusMapped) || !(armStateCheck || armStatusMapped))
         {
             retVal = MYKONOS_ERR_OK;
             break;
@@ -16167,6 +16180,9 @@ mykonosErr_t MYKONOS_waitArmCmdStatus(mykonosDevice_t *device, uint8_t opCode, u
         {
             return MYKONOS_ERR_WAITARMCMDSTATUS_TIMEOUT;
         }
+
+        CMB_wait_ms(1);
+
     } while (*cmdStatByte & 0x01);
 
     return MYKONOS_ERR_OK;

@@ -7,9 +7,10 @@
  * Contacts: Saurabh Sengar <saurabhs@xilinx.com>
  */
 
-#include <drm/drmP.h>
+#include <drm/drm_print.h>
 #include <linux/device.h>
 #include <video/videomode.h>
+#include <asm/io.h>
 #include "xlnx_sdi_timing.h"
 
 /* timing controller register offsets */
@@ -339,8 +340,13 @@ void xlnx_stc_sig(void __iomem *base, struct videomode *vm)
 	reg |= (vactive & XSTC_GA_ACTSIZE_MASK) << 16;
 	xlnx_stc_writel(base, XSTC_GASIZE, reg);
 
-	if (vm->flags & DISPLAY_FLAGS_INTERLACED)
+	if (vm->flags & DISPLAY_FLAGS_INTERLACED) {
+		if (vactive == 243)
+			reg = ((vactive + 1) & XSTC_GA_ACTSIZE_MASK) << 16;
+		else
+			reg = (vactive & XSTC_GA_ACTSIZE_MASK) << 16;
 		xlnx_stc_writel(base, XSTC_GASIZE_F1, reg);
+	}
 
 	reg = hsync_start & XSTC_GH1_SYNCSTART_MASK;
 	reg |= (hbackporch_start << XSTC_GH1_BPSTART_SHIFT) &

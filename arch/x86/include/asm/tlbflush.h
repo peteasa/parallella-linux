@@ -9,101 +9,55 @@
 #include <asm/cpufeature.h>
 #include <asm/special_insns.h>
 #include <asm/smp.h>
+#include <asm/invpcid.h>
+#include <asm/pti.h>
+#include <asm/processor-flags.h>
 
-static inline void __invpcid(unsigned long pcid, unsigned long addr,
-			     unsigned long type)
+void __flush_tlb_all(void);
+
+#define TLB_FLUSH_ALL	-1UL
+
+void cr4_update_irqsoff(unsigned long set, unsigned long clear);
+unsigned long cr4_read_shadow(void);
+
+/* Set in this cpu's CR4. */
+static inline void cr4_set_bits_irqsoff(unsigned long mask)
 {
-	struct { u64 d[2]; } desc = { { pcid, addr } };
-
-	/*
-	 * The memory clobber is because the whole point is to invalidate
-	 * stale TLB entries and, especially if we're flushing global
-	 * mappings, we don't want the compiler to reorder any subsequent
-	 * memory accesses before the TLB flush.
-	 *
-	 * The hex opcode is invpcid (%ecx), %eax in 32-bit mode and
-	 * invpcid (%rcx), %rax in long mode.
-	 */
-	asm volatile (".byte 0x66, 0x0f, 0x38, 0x82, 0x01"
-		      : : "m" (desc), "a" (type), "c" (&desc) : "memory");
+	cr4_update_irqsoff(mask, 0);
 }
 
-#define INVPCID_TYPE_INDIV_ADDR		0
-#define INVPCID_TYPE_SINGLE_CTXT	1
-#define INVPCID_TYPE_ALL_INCL_GLOBAL	2
-#define INVPCID_TYPE_ALL_NON_GLOBAL	3
-
-/* Flush all mappings for a given pcid and addr, not including globals. */
-static inline void invpcid_flush_one(unsigned long pcid,
-				     unsigned long addr)
+/* Clear in this cpu's CR4. */
+static inline void cr4_clear_bits_irqsoff(unsigned long mask)
 {
-	__invpcid(pcid, addr, INVPCID_TYPE_INDIV_ADDR);
+	cr4_update_irqsoff(0, mask);
 }
 
-/* Flush all mappings for a given PCID, not including globals. */
-static inline void invpcid_flush_single_context(unsigned long pcid)
+/* Set in this cpu's CR4. */
+static inline void cr4_set_bits(unsigned long mask)
 {
-	__invpcid(pcid, 0, INVPCID_TYPE_SINGLE_CTXT);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	cr4_set_bits_irqsoff(mask);
+	local_irq_restore(flags);
 }
 
-/* Flush all mappings, including globals, for all PCIDs. */
-static inline void invpcid_flush_all(void)
+/* Clear in this cpu's CR4. */
+static inline void cr4_clear_bits(unsigned long mask)
 {
-	__invpcid(0, 0, INVPCID_TYPE_ALL_INCL_GLOBAL);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	cr4_clear_bits_irqsoff(mask);
+	local_irq_restore(flags);
 }
 
-/* Flush all mappings for all PCIDs except globals. */
-static inline void invpcid_flush_all_nonglobals(void)
-{
-	__invpcid(0, 0, INVPCID_TYPE_ALL_NON_GLOBAL);
-}
-
-static inline u64 inc_mm_tlb_gen(struct mm_struct *mm)
-{
-	u64 new_tlb_gen;
-
-	/*
-	 * Bump the generation count.  This also serves as a full barrier
-	 * that synchronizes with switch_mm(): callers are required to order
-	 * their read of mm_cpumask after their writes to the paging
-	 * structures.
-	 */
-	smp_mb__before_atomic();
-	new_tlb_gen = atomic64_inc_return(&mm->context.tlb_gen);
-	smp_mb__after_atomic();
-
-	return new_tlb_gen;
-}
-
-#ifdef CONFIG_PARAVIRT
-#include <asm/paravirt.h>
-#else
-#define __flush_tlb() __native_flush_tlb()
-#define __flush_tlb_global() __native_flush_tlb_global()
-#define __flush_tlb_single(addr) __native_flush_tlb_single(addr)
-#endif
-
-static inline bool tlb_defer_switch_to_init_mm(void)
-{
-	/*
-	 * If we have PCID, then switching to init_mm is reasonably
-	 * fast.  If we don't have PCID, then switching to init_mm is
-	 * quite slow, so we try to defer it in the hopes that we can
-	 * avoid it entirely.  The latter approach runs the risk of
-	 * receiving otherwise unnecessary IPIs.
-	 *
-	 * This choice is just a heuristic.  The tlb code can handle this
-	 * function returning true or false regardless of whether we have
-	 * PCID.
-	 */
-	return !static_cpu_has(X86_FEATURE_PCID);
-}
-
+#ifndef MODULE
 /*
- * 6 because 6 should be plenty and struct tlb_state will fit in
- * two cache lines.
+ * 6 because 6 should be plenty and struct tlb_state will fit in two cache
+ * lines.
  */
-#define TLB_NR_DYN_ASIDS 6
+#define TLB_NR_DYN_ASIDS	6
 
 struct tlb_context {
 	u64 ctx_id;
@@ -116,8 +70,22 @@ struct tlb_state {
 	 * are on.  This means that it may not match current->active_mm,
 	 * which will contain the previous user mm when we're in lazy TLB
 	 * mode even if we've already switched back to swapper_pg_dir.
+	 *
+	 * During switch_mm_irqs_off(), loaded_mm will be set to
+	 * LOADED_MM_SWITCHING during the brief interrupts-off window
+	 * when CR3 and loaded_mm would otherwise be inconsistent.  This
+	 * is for nmi_uaccess_okay()'s benefit.
 	 */
 	struct mm_struct *loaded_mm;
+
+#define LOADED_MM_SWITCHING ((struct mm_struct *)1UL)
+
+	/* Last user mm for optimizing IBPB */
+	union {
+		struct mm_struct	*last_user_mm;
+		unsigned long		last_user_mm_ibpb;
+	};
+
 	u16 loaded_mm_asid;
 	u16 next_asid;
 
@@ -137,6 +105,24 @@ struct tlb_state {
 	 *    lazy mode.
 	 */
 	bool is_lazy;
+
+	/*
+	 * If set we changed the page tables in such a way that we
+	 * needed an invalidation of all contexts (aka. PCIDs / ASIDs).
+	 * This tells us to go invalidate all the non-loaded ctxs[]
+	 * on the next context switch.
+	 *
+	 * The current ctx was kept up-to-date as it ran and does not
+	 * need to be invalidated.
+	 */
+	bool invalidate_other;
+
+	/*
+	 * Mask that contains TLB_NR_DYN_ASIDS+1 bits to indicate
+	 * the corresponding user PCID needs a flush next time we
+	 * switch to it; see SWITCH_TO_USER_CR3.
+	 */
+	unsigned short user_pcid_flush_mask;
 
 	/*
 	 * Access to this CR4 shadow and to H/W CR4 is protected by
@@ -167,149 +153,19 @@ struct tlb_state {
 };
 DECLARE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate);
 
+bool nmi_uaccess_okay(void);
+#define nmi_uaccess_okay nmi_uaccess_okay
+
 /* Initialize cr4 shadow for this CPU. */
 static inline void cr4_init_shadow(void)
 {
 	this_cpu_write(cpu_tlbstate.cr4, __read_cr4());
 }
 
-/* Set in this cpu's CR4. */
-static inline void cr4_set_bits(unsigned long mask)
-{
-	unsigned long cr4;
-
-	cr4 = this_cpu_read(cpu_tlbstate.cr4);
-	if ((cr4 | mask) != cr4) {
-		cr4 |= mask;
-		this_cpu_write(cpu_tlbstate.cr4, cr4);
-		__write_cr4(cr4);
-	}
-}
-
-/* Clear in this cpu's CR4. */
-static inline void cr4_clear_bits(unsigned long mask)
-{
-	unsigned long cr4;
-
-	cr4 = this_cpu_read(cpu_tlbstate.cr4);
-	if ((cr4 & ~mask) != cr4) {
-		cr4 &= ~mask;
-		this_cpu_write(cpu_tlbstate.cr4, cr4);
-		__write_cr4(cr4);
-	}
-}
-
-static inline void cr4_toggle_bits(unsigned long mask)
-{
-	unsigned long cr4;
-
-	cr4 = this_cpu_read(cpu_tlbstate.cr4);
-	cr4 ^= mask;
-	this_cpu_write(cpu_tlbstate.cr4, cr4);
-	__write_cr4(cr4);
-}
-
-/* Read the CR4 shadow. */
-static inline unsigned long cr4_read_shadow(void)
-{
-	return this_cpu_read(cpu_tlbstate.cr4);
-}
-
-/*
- * Save some of cr4 feature set we're using (e.g.  Pentium 4MB
- * enable and PPro Global page enable), so that any CPU's that boot
- * up after us can get the correct flags.  This should only be used
- * during boot on the boot cpu.
- */
 extern unsigned long mmu_cr4_features;
 extern u32 *trampoline_cr4_features;
 
-static inline void cr4_set_bits_and_update_boot(unsigned long mask)
-{
-	mmu_cr4_features |= mask;
-	if (trampoline_cr4_features)
-		*trampoline_cr4_features = mmu_cr4_features;
-	cr4_set_bits(mask);
-}
-
 extern void initialize_tlbstate_and_flush(void);
-
-static inline void __native_flush_tlb(void)
-{
-	/*
-	 * If current->mm == NULL then we borrow a mm which may change during a
-	 * task switch and therefore we must not be preempted while we write CR3
-	 * back:
-	 */
-	preempt_disable();
-	native_write_cr3(__native_read_cr3());
-	preempt_enable();
-}
-
-static inline void __native_flush_tlb_global_irq_disabled(void)
-{
-	unsigned long cr4;
-
-	cr4 = this_cpu_read(cpu_tlbstate.cr4);
-	/* clear PGE */
-	native_write_cr4(cr4 & ~X86_CR4_PGE);
-	/* write old PGE again and flush TLBs */
-	native_write_cr4(cr4);
-}
-
-static inline void __native_flush_tlb_global(void)
-{
-	unsigned long flags;
-
-	if (static_cpu_has(X86_FEATURE_INVPCID)) {
-		/*
-		 * Using INVPCID is considerably faster than a pair of writes
-		 * to CR4 sandwiched inside an IRQ flag save/restore.
-		 */
-		invpcid_flush_all();
-		return;
-	}
-
-	/*
-	 * Read-modify-write to CR4 - protect it from preemption and
-	 * from interrupts. (Use the raw variant because this code can
-	 * be called from deep inside debugging code.)
-	 */
-	raw_local_irq_save(flags);
-
-	__native_flush_tlb_global_irq_disabled();
-
-	raw_local_irq_restore(flags);
-}
-
-static inline void __native_flush_tlb_single(unsigned long addr)
-{
-	asm volatile("invlpg (%0)" ::"r" (addr) : "memory");
-}
-
-static inline void __flush_tlb_all(void)
-{
-	if (boot_cpu_has(X86_FEATURE_PGE))
-		__flush_tlb_global();
-	else
-		__flush_tlb();
-
-	/*
-	 * Note: if we somehow had PCID but not PGE, then this wouldn't work --
-	 * we'd end up flushing kernel translations for the current ASID but
-	 * we might fail to flush kernel translations for other cached ASIDs.
-	 *
-	 * To avoid this issue, we force PCID off if PGE is off.
-	 */
-}
-
-static inline void __flush_tlb_one(unsigned long addr)
-{
-	count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ONE);
-	__flush_tlb_single(addr);
-}
-
-#define TLB_FLUSH_ALL	-1UL
 
 /*
  * TLB flushing:
@@ -345,27 +201,50 @@ struct flush_tlb_info {
 	unsigned long		start;
 	unsigned long		end;
 	u64			new_tlb_gen;
+	unsigned int		stride_shift;
+	bool			freed_tables;
 };
 
-#define local_flush_tlb() __flush_tlb()
+void flush_tlb_local(void);
+void flush_tlb_one_user(unsigned long addr);
+void flush_tlb_one_kernel(unsigned long addr);
+void flush_tlb_others(const struct cpumask *cpumask,
+		      const struct flush_tlb_info *info);
 
-#define flush_tlb_mm(mm)	flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, 0UL)
+#ifdef CONFIG_PARAVIRT
+#include <asm/paravirt.h>
+#endif
 
-#define flush_tlb_range(vma, start, end)	\
-		flush_tlb_mm_range(vma->vm_mm, start, end, vma->vm_flags)
+#define flush_tlb_mm(mm)						\
+		flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, 0UL, true)
+
+#define flush_tlb_range(vma, start, end)				\
+	flush_tlb_mm_range((vma)->vm_mm, start, end,			\
+			   ((vma)->vm_flags & VM_HUGETLB)		\
+				? huge_page_shift(hstate_vma(vma))	\
+				: PAGE_SHIFT, false)
 
 extern void flush_tlb_all(void);
 extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
-				unsigned long end, unsigned long vmflag);
+				unsigned long end, unsigned int stride_shift,
+				bool freed_tables);
 extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
 
 static inline void flush_tlb_page(struct vm_area_struct *vma, unsigned long a)
 {
-	flush_tlb_mm_range(vma->vm_mm, a, a + PAGE_SIZE, VM_NONE);
+	flush_tlb_mm_range(vma->vm_mm, a, a + PAGE_SIZE, PAGE_SHIFT, false);
 }
 
-void native_flush_tlb_others(const struct cpumask *cpumask,
-			     const struct flush_tlb_info *info);
+static inline u64 inc_mm_tlb_gen(struct mm_struct *mm)
+{
+	/*
+	 * Bump the generation count.  This also serves as a full barrier
+	 * that synchronizes with switch_mm(): callers are required to order
+	 * their read of mm_cpumask after their writes to the paging
+	 * structures.
+	 */
+	return atomic64_inc_return(&mm->context.tlb_gen);
+}
 
 static inline void arch_tlbbatch_add_mm(struct arch_tlbflush_unmap_batch *batch,
 					struct mm_struct *mm)
@@ -376,9 +255,6 @@ static inline void arch_tlbbatch_add_mm(struct arch_tlbflush_unmap_batch *batch,
 
 extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);
 
-#ifndef CONFIG_PARAVIRT
-#define flush_tlb_others(mask, info)	\
-	native_flush_tlb_others(mask, info)
-#endif
+#endif /* !MODULE */
 
 #endif /* _ASM_X86_TLBFLUSH_H */

@@ -1,14 +1,14 @@
 /dts-v1/;
 
-/include/ "zynq-zc706.dtsi"
-/include/ "zynq-zc706-adv7511.dtsi"
+#include "zynq-zc706.dtsi"
+#include "zynq-zc706-adv7511.dtsi"
 
 &fpga_axi {
 	rx_dma: dma@44a60000 {
 		compatible = "adi,axi-dmac-1.00.a";
 		reg = <0x44a60000 0x10000>;
 		#dma-cells = <1>;
-		interrupts = <0 57 0>;
+		interrupts = <0 57 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkc 16>;
 
 		adi,channels {

@@ -352,7 +352,6 @@ static const struct iio_info ad9508_info = {
 	.write_raw = &ad9508_write_raw,
 	.debugfs_reg_access = &ad9508_reg_access,
 	.attrs = &ad9508_attribute_group,
-	.driver_module = THIS_MODULE,
 };
 
 static unsigned long ad9508_clk_recalc_rate(struct clk_hw *hw,
@@ -466,7 +465,7 @@ static int ad9508_setup(struct iio_dev *indio_dev)
 
 	ret = ad9508_write(indio_dev, AD9508_SERIAL_PORT_CONFIG,
 			AD9508_SER_CONF_SOFT_RESET |
-			((st->spi->mode & SPI_3WIRE || pdata->spi3wire)? 0 :
+			((st->spi->mode & SPI_3WIRE || pdata->spi3wire) ? 0 :
 			 AD9508_SER_CONF_SDO_ACTIVE));
 	if (ret < 0)
 		return ret;

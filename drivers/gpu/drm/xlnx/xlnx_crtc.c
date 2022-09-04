@@ -16,9 +16,11 @@
  * GNU General Public License for more details.
  */
 
-#include <drm/drmP.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_crtc.h>
 
 #include <linux/list.h>
+#include <linux/dma-mapping.h>
 
 #include "xlnx_crtc.h"
 #include "xlnx_drv.h"
@@ -49,7 +51,7 @@ struct xlnx_crtc_helper {
 	struct drm_device *drm;
 };
 
-#define XLNX_CRTC_MAX_HEIGHT_WIDTH	UINT_MAX
+#define XLNX_CRTC_MAX_HEIGHT_WIDTH	INT_MAX
 
 unsigned int xlnx_crtc_helper_get_align(struct xlnx_crtc_helper *helper)
 {
@@ -84,7 +86,7 @@ u64 xlnx_crtc_helper_get_dma_mask(struct xlnx_crtc_helper *helper)
 int xlnx_crtc_helper_get_max_width(struct xlnx_crtc_helper *helper)
 {
 	struct xlnx_crtc *crtc;
-	unsigned int width = XLNX_CRTC_MAX_HEIGHT_WIDTH, tmp;
+	int width = XLNX_CRTC_MAX_HEIGHT_WIDTH, tmp;
 
 	list_for_each_entry(crtc, &helper->xlnx_crtcs, list) {
 		if (crtc->get_max_width) {
@@ -99,7 +101,7 @@ int xlnx_crtc_helper_get_max_width(struct xlnx_crtc_helper *helper)
 int xlnx_crtc_helper_get_max_height(struct xlnx_crtc_helper *helper)
 {
 	struct xlnx_crtc *crtc;
-	unsigned int height = XLNX_CRTC_MAX_HEIGHT_WIDTH, tmp;
+	int height = XLNX_CRTC_MAX_HEIGHT_WIDTH, tmp;
 
 	list_for_each_entry(crtc, &helper->xlnx_crtcs, list) {
 		if (crtc->get_max_height) {

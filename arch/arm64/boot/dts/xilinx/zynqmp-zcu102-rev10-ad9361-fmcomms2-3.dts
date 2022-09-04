@@ -1,12 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * dts file for FMCOMMS2/3 AD9361 on Xilinx ZynqMP ZCU102 Rev 1.0
+ * Analog Devices AD-FMCOMMS2-EBZ/AD-FMCOMMS3-EBZ
+ * https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms2-ebz
+ * https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms3-ebz
  *
- * Copyright (C) 2016-2017 Analog Devices Inc.
+ * hdl_project: <fmcomms2/zcu102>
+ * board_revision: <>
  *
- * Licensed under the GPL-2.
+ * Copyright (C) 2014-2019 Analog Devices Inc.
  */
 
 #include "zynqmp-zcu102-rev1.0.dts"
+#include <dt-bindings/interrupt-controller/irq.h>
 
 &i2c1 {
 	i2c-mux@75 {
@@ -42,8 +47,8 @@
 			reg = <0x9c400000 0x10000>;
 			#dma-cells = <1>;
 			#clock-cells = <0>;
-			interrupts = <0 109 0>;
-			clocks = <&clk 71>;
+			interrupts = <0 109 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&zynqmp_clk 71>;
 
 			adi,channels {
 				#size-cells = <0>;
@@ -64,8 +69,8 @@
 			reg = <0x9c420000 0x10000>;
 			#dma-cells = <1>;
 			#clock-cells = <0>;
-			interrupts = <0 108 0>;
-			clocks = <&clk 71>;
+			interrupts = <0 108 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&zynqmp_clk 71>;
 
 			adi,channels {
 				#size-cells = <0>;
@@ -96,6 +101,11 @@
 			clock-names = "sampl_clk";
 			dmas = <&tx_dma 0>;
 			dma-names = "tx";
+		};
+
+		axi_sysid_0: axi-sysid-0@85000000 {
+			compatible = "adi,axi-sysid-1.00.a";
+			reg = <0x85000000 0x10000>;
 		};
 	};
 };

@@ -169,7 +169,7 @@ static void ams_enable_channel_sequence(struct ams *ams)
 {
 	int i;
 	unsigned long long scan_mask;
-	struct iio_dev *indio_dev = iio_priv_to_dev(ams);
+	struct iio_dev *indio_dev = ams->indio_dev;
 
 	/* Enable channel sequence. First 22 bit of scan_mask represent
 	 * PS channels, and  next remaining bit represents PL channels.
@@ -967,7 +967,6 @@ static int ams_parse_dt(struct iio_dev *indio_dev, struct platform_device *pdev)
 }
 
 static const struct iio_info iio_pl_info = {
-	.driver_module = THIS_MODULE,
 	.read_raw = &ams_read_raw,
 	.read_event_config = &ams_read_event_config,
 	.write_event_config = &ams_write_event_config,
@@ -1007,6 +1006,7 @@ static int ams_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ams = iio_priv(indio_dev);
+	ams->indio_dev = indio_dev;
 	ams->pl_bus = id->data;
 	mutex_init(&ams->mutex);
 	spin_lock_init(&ams->lock);

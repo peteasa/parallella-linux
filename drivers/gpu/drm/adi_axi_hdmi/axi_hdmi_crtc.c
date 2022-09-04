@@ -13,8 +13,11 @@
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_gem_cma_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_plane_helper.h>
+#include <drm/drm_vblank.h>
 
 #include "axi_hdmi_drv.h"
 
@@ -41,11 +44,11 @@ static struct dma_async_tx_descriptor *axi_hdmi_vdma_prep_interleaved_desc(
 {
 	struct axi_hdmi_crtc *axi_hdmi_crtc = plane_to_axi_hdmi_crtc(plane);
 	struct drm_framebuffer *fb = plane->state->fb;
-	struct xilinx_vdma_config vdma_config;
 	size_t offset, hw_row_size;
 	struct drm_gem_cma_object *obj;
 
-	obj = drm_fb_cma_get_gem_obj(plane->state->fb, 0);
+#if IS_ENABLED(CONFIG_XILINX_DMA)
+	struct xilinx_vdma_config vdma_config;
 
 	if (!strncmp(axi_hdmi_crtc->dma->device->dev->driver->name, "xilinx-vdma", 11)) {
 		memset(&vdma_config, 0, sizeof(vdma_config));
@@ -53,6 +56,9 @@ static struct dma_async_tx_descriptor *axi_hdmi_vdma_prep_interleaved_desc(
 		vdma_config.coalesc = 0xff;
 		xilinx_vdma_channel_set_config(axi_hdmi_crtc->dma, &vdma_config);
 	}
+#endif
+
+	obj = drm_fb_cma_get_gem_obj(plane->state->fb, 0);
 
 	offset = plane->state->crtc_x * fb->format->cpp[0] +
 		plane->state->crtc_y * fb->pitches[0];
@@ -168,7 +174,6 @@ static const struct drm_plane_helper_funcs axi_hdmi_plane_helper_funcs = {
 
 static void axi_hdmi_plane_destroy(struct drm_plane *plane)
 {
-	drm_plane_helper_disable(plane);
 	drm_plane_cleanup(plane);
 }
 

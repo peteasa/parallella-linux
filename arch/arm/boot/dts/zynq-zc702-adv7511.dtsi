@@ -9,7 +9,7 @@
 			compatible = "xlnx,axi-iic-1.02.a", "xlnx,xps-iic-2.00.a";
 			reg = <0x41600000 0x10000>;
 			interrupt-parent = <&intc>;
-			interrupts = <0 58 4>;
+			interrupts = <0 58 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 15>;
 			clock-names = "pclk";
 
@@ -38,7 +38,7 @@
 						adi,input-justification = "right";
 						adi,clock-delay = <0>;
 
-						#sound-dai-cells = <0>;
+						#sound-dai-cells = <1>;
 
 						ports {
 							#address-cells = <1>;
@@ -82,7 +82,7 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x43000000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 59 0>;
+			interrupts = <0 59 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
 
 			adi,channels {
@@ -103,7 +103,8 @@
 			compatible = "adi,axi-clkgen-2.00.a";
 			reg = <0x79000000 0x10000>;
 			#clock-cells = <0>;
-			clocks = <&clkc 16>;
+			clocks = <&clkc 15>, <&clkc 16>;
+			clock-names = "s_axi_aclk", "clkin1";
 		};
 
 		axi_hdmi@70e00000 {
@@ -131,6 +132,10 @@
 			#sound-dai-cells = <0>;
 		};
 
+		axi_sysid_0: axi-sysid-0@45000000 {
+			compatible = "adi,axi-sysid-1.00.a";
+			reg = <0x45000000 0x10000>;
+		};
 	};
 
 	audio_clock: audio_clock {
@@ -155,7 +160,7 @@
 				bitclock-master;
 			};
 			codec {
-				sound-dai = <&adv7511>;
+				sound-dai = <&adv7511 1>;
 			};
 		};
 	};

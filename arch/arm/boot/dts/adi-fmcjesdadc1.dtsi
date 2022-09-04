@@ -34,6 +34,8 @@
 			spi-max-frequency = <10000000>;
 			adi,spi-3wire-enable;
 
+			firmware = "ad9517.stp";
+
 			clocks = <&ad9517_ref_clk>, <&ad9517_clkin>;
 			clock-names = "refclk", "clkin";
 
@@ -42,7 +44,7 @@
 		};
 
 		adc0_ad9250: ad9250-0@0 {
-			compatible = "adi,ad9250";
+			compatible = "adi,ad9250_2";
 			reg = <2>;
 
 			spi-max-frequency = <10000000>;
@@ -52,7 +54,7 @@
 		};
 
 		adc1_ad9250: ad9250-1@1 {
-			compatible = "adi,ad9250";
+			compatible = "adi,ad9250_2";
 			reg = <3>;
 
 			spi-max-frequency = <10000000>;

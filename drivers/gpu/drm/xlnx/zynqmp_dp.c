@@ -2,39 +2,32 @@
 /*
  * ZynqMP DisplayPort Driver
  *
- *  Copyright (C) 2017 - 2018 Xilinx, Inc.
+ * Copyright (C) 2017 - 2020 Xilinx, Inc.
  *
- *  Author: Hyun Woo Kwon <hyun.kwon@xilinx.com>
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Authors:
+ * - Hyun Woo Kwon <hyun.kwon@xilinx.com>
+ * - Laurent Pinchart <laurent.pinchart@ideasonboard.com>
  */
 
-#include <drm/drmP.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_dp_helper.h>
 #include <drm/drm_of.h>
+#include <drm/drm_probe_helper.h>
 
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/phy/phy.h>
-#include <linux/phy/phy-zynqmp.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/phy/phy.h>
 #include <linux/uaccess.h>
 
 #include "zynqmp_disp.h"
+#include "zynqmp_dp.h"
 #include "zynqmp_dpsub.h"
 
 static uint zynqmp_dp_aux_timeout_ms = 50;
@@ -46,7 +39,7 @@ MODULE_PARM_DESC(aux_timeout_ms, "DP aux timeout value in msec (default: 50)");
  */
 static uint zynqmp_dp_power_on_delay_ms = 4;
 module_param_named(power_on_delay_ms, zynqmp_dp_power_on_delay_ms, uint, 0444);
-MODULE_PARM_DESC(aux_timeout_ms, "DP power on delay in msec (default: 4)");
+MODULE_PARM_DESC(power_on_delay_ms, "DP power on delay in msec (default: 4)");
 
 /* Link configuration registers */
 #define ZYNQMP_DP_TX_LINK_BW_SET			0x0
@@ -379,6 +372,158 @@ static void zynqmp_dp_set(void __iomem *base, int offset, u32 set)
 	zynqmp_dp_write(base, offset, zynqmp_dp_read(base, offset) | set);
 }
 
+/* -----------------------------------------------------------------------------
+ * PHY Handling
+ */
+
+/**
+ * zynqmp_dp_phy_init - Initialize the phy
+ * @dp: DisplayPort IP core structure
+ *
+ * Initialize the phy.
+ *
+ * Return: 0 if the phy instances are initialized correctly, or the error code
+ * returned from the callee functions.
+ */
+static int zynqmp_dp_phy_init(struct zynqmp_dp *dp)
+{
+	int ret;
+	int i;
+
+	for (i = 0; i < dp->num_lanes; i++) {
+		ret = phy_init(dp->phy[i]);
+		if (ret) {
+			dev_err(dp->dev, "failed to init phy lane %d\n", i);
+			return ret;
+		}
+	}
+
+	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_SUB_TX_INTR_DS, ZYNQMP_DP_TX_INTR_ALL);
+	zynqmp_dp_clr(dp->iomem, ZYNQMP_DP_TX_PHY_CONFIG, ZYNQMP_DP_TX_PHY_CONFIG_ALL_RESET);
+
+	/*
+	 * Power on lanes in reverse order as only lane 0 waits for the PLL to
+	 * lock.
+	 */
+	for (i = dp->num_lanes - 1; i >= 0; i--) {
+		ret = phy_power_on(dp->phy[i]);
+		if (ret) {
+			dev_err(dp->dev, "failed to power on phy lane %d\n", i);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * zynqmp_dp_phy_exit - Exit the phy
+ * @dp: DisplayPort IP core structure
+ *
+ * Exit the phy.
+ */
+static void zynqmp_dp_phy_exit(struct zynqmp_dp *dp)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < dp->num_lanes; i++) {
+		ret = phy_power_off(dp->phy[i]);
+		if (ret)
+			dev_err(dp->dev, "failed to power off phy(%d) %d\n", i,
+				ret);
+	}
+
+	for (i = 0; i < dp->num_lanes; i++) {
+		ret = phy_exit(dp->phy[i]);
+		if (ret)
+			dev_err(dp->dev, "failed to exit phy(%d) %d\n", i, ret);
+	}
+}
+
+/**
+ * zynqmp_dp_phy_probe - Probe the PHYs
+ * @dp: DisplayPort IP core structure
+ *
+ * Probe PHYs for all lanes. Less PHYs may be available than the number of
+ * lanes, which is not considered an error as long as at least one PHY is
+ * found. The caller can check dp->num_lanes to check how many PHYs were found.
+ *
+ * Return:
+ * * 0				- Success
+ * * -ENXIO			- No PHY found
+ * * -EPROBE_DEFER		- Probe deferral requested
+ * * Other negative value	- PHY retrieval failure
+ */
+static int zynqmp_dp_phy_probe(struct zynqmp_dp *dp)
+{
+	unsigned int i;
+
+	for (i = 0; i < ZYNQMP_DP_MAX_LANES; i++) {
+		char phy_name[16];
+		struct phy *phy;
+
+		snprintf(phy_name, sizeof(phy_name), "dp-phy%d", i);
+		phy = devm_phy_get(dp->dev, phy_name);
+
+		if (IS_ERR(phy)) {
+			switch (PTR_ERR(phy)) {
+			case -ENODEV:
+				if (dp->num_lanes)
+					return 0;
+
+				dev_err(dp->dev, "no PHY found\n");
+				return -ENXIO;
+
+			case -EPROBE_DEFER:
+				return -EPROBE_DEFER;
+
+			default:
+				dev_err(dp->dev, "failed to get PHY lane %u\n",
+					i);
+				return PTR_ERR(phy);
+			}
+		}
+
+		dp->phy[i] = phy;
+		dp->num_lanes++;
+	}
+
+	return 0;
+}
+
+/**
+ * zynqmp_dp_phy_ready - Check if PHY is ready
+ * @dp: DisplayPort IP core structure
+ *
+ * Check if PHY is ready. If PHY is not ready, wait 1ms to check for 100 times.
+ * This amount of delay was suggested by IP designer.
+ *
+ * Return: 0 if PHY is ready, or -ENODEV if PHY is not ready.
+ */
+static int zynqmp_dp_phy_ready(struct zynqmp_dp *dp)
+{
+	u32 i, reg, ready;
+
+	ready = (1 << dp->num_lanes) - 1;
+
+	/* Wait for 100 * 1ms. This should be enough time for PHY to be ready */
+	for (i = 0; ; i++) {
+		reg = zynqmp_dp_read(dp->iomem, ZYNQMP_DP_TX_PHY_STATUS);
+		if ((reg & ready) == ready)
+			return 0;
+
+		if (i == 100) {
+			dev_err(dp->dev, "PHY isn't ready\n");
+			return -ENODEV;
+		}
+
+		usleep_range(1000, 1100);
+	}
+
+	return 0;
+}
+
 /*
  * Internal functions: used by zynqmp_disp.c
  */
@@ -459,98 +604,6 @@ void zynqmp_dp_disable_vblank(struct zynqmp_dp *dp)
 }
 
 /*
- * DP PHY functions
- */
-
-/**
- * zynqmp_dp_init_phy - Initialize the phy
- * @dp: DisplayPort IP core structure
- *
- * Initialize the phy.
- *
- * Return: 0 if the phy instances are initialized correctly, or the error code
- * returned from the callee functions.
- * Note: We can call this function without any phy lane assigned to DP.
- */
-static int zynqmp_dp_init_phy(struct zynqmp_dp *dp)
-{
-	unsigned int i;
-	int ret;
-
-	for (i = 0; i < dp->num_lanes; i++) {
-		ret = phy_init(dp->phy[i]);
-		if (ret) {
-			dev_err(dp->dev, "failed to init phy lane %d\n", i);
-			return ret;
-		}
-	}
-	/* Wait for PLL to be locked for the primary (1st) lane */
-	if (dp->phy[0]) {
-		zynqmp_dp_write(dp->iomem, ZYNQMP_DP_SUB_TX_INTR_DS,
-				ZYNQMP_DP_TX_INTR_ALL);
-		zynqmp_dp_clr(dp->iomem, ZYNQMP_DP_TX_PHY_CONFIG,
-				ZYNQMP_DP_TX_PHY_CONFIG_ALL_RESET);
-		ret = xpsgtr_wait_pll_lock(dp->phy[0]);
-		if (ret) {
-			dev_err(dp->dev, "failed to lock pll\n");
-			return ret;
-		}
-	}
-
-	return 0;
-}
-
-/**
- * zynqmp_dp_exit_phy - Exit the phy
- * @dp: DisplayPort IP core structure
- *
- * Exit the phy.
- */
-static void zynqmp_dp_exit_phy(struct zynqmp_dp *dp)
-{
-	unsigned int i;
-	int ret;
-
-	for (i = 0; i < dp->num_lanes; i++) {
-		ret = phy_exit(dp->phy[i]);
-		if (ret)
-			dev_err(dp->dev, "failed to exit phy(%d) %d\n", i, ret);
-	}
-}
-
-/**
- * zynqmp_dp_phy_ready - Check if PHY is ready
- * @dp: DisplayPort IP core structure
- *
- * Check if PHY is ready. If PHY is not ready, wait 1ms to check for 100 times.
- * This amount of delay was suggested by IP designer.
- *
- * Return: 0 if PHY is ready, or -ENODEV if PHY is not ready.
- */
-static int zynqmp_dp_phy_ready(struct zynqmp_dp *dp)
-{
-	u32 i, reg, ready;
-
-	ready = (1 << dp->num_lanes) - 1;
-
-	/* Wait for 100 * 1ms. This should be enough time for PHY to be ready */
-	for (i = 0; ; i++) {
-		reg = zynqmp_dp_read(dp->iomem, ZYNQMP_DP_TX_PHY_STATUS);
-		if ((reg & ready) == ready)
-			return 0;
-
-		if (i == 100) {
-			dev_err(dp->dev, "PHY isn't ready\n");
-			return -ENODEV;
-		}
-
-		usleep_range(1000, 1100);
-	}
-
-	return 0;
-}
-
-/*
  * Power Management functions
  */
 /**
@@ -561,8 +614,9 @@ static int zynqmp_dp_phy_ready(struct zynqmp_dp *dp)
  */
 void zynqmp_dp_pm_resume(struct zynqmp_dp *dp)
 {
-	zynqmp_dp_init_phy(dp);
+	zynqmp_dp_phy_init(dp);
 }
+
 /**
  * zynqmp_dp_pm_suspend - Suspend DP IP
  * @dp: DisplayPort IP core structure
@@ -571,8 +625,9 @@ void zynqmp_dp_pm_resume(struct zynqmp_dp *dp)
  */
 void zynqmp_dp_pm_suspend(struct zynqmp_dp *dp)
 {
-	zynqmp_dp_exit_phy(dp);
+	zynqmp_dp_phy_exit(dp);
 }
+
 /*
  * DP functions
  */
@@ -607,34 +662,37 @@ static int zynqmp_dp_mode_configure(struct zynqmp_dp *dp, int pclock,
 				    u8 current_bw)
 {
 	int max_rate = dp->link_config.max_rate;
-	u8 bws[3] = { DP_LINK_BW_1_62, DP_LINK_BW_2_7, DP_LINK_BW_5_4 };
+	u8 bw_code;
 	u8 max_lanes = dp->link_config.max_lanes;
 	u8 max_link_rate_code = drm_dp_link_rate_to_bw_code(max_rate);
 	u8 bpp = dp->config.bpp;
 	u8 lane_cnt;
-	s8 i;
 
-	if (current_bw == DP_LINK_BW_1_62) {
+	/* Downshift from current bandwidth */
+	switch (current_bw) {
+	case DP_LINK_BW_5_4:
+		bw_code = DP_LINK_BW_2_7;
+		break;
+	case DP_LINK_BW_2_7:
+		bw_code = DP_LINK_BW_1_62;
+		break;
+	case DP_LINK_BW_1_62:
 		dev_err(dp->dev, "can't downshift. already lowest link rate\n");
 		return -EINVAL;
-	}
-
-	for (i = ARRAY_SIZE(bws) - 1; i >= 0; i--) {
-		if (current_bw && bws[i] >= current_bw)
-			continue;
-
-		if (bws[i] <= max_link_rate_code)
-			break;
+	default:
+		/* If not given, start with max supported */
+		bw_code = max_link_rate_code;
+		break;
 	}
 
 	for (lane_cnt = 1; lane_cnt <= max_lanes; lane_cnt <<= 1) {
 		int bw;
 		u32 rate;
 
-		bw = drm_dp_bw_code_to_link_rate(bws[i]);
+		bw = drm_dp_bw_code_to_link_rate(bw_code);
 		rate = zynqmp_dp_max_rate(bw, lane_cnt, bpp);
 		if (pclock <= rate) {
-			dp->mode.bw_code = bws[i];
+			dp->mode.bw_code = bw_code;
 			dp->mode.lane_cnt = lane_cnt;
 			dp->mode.pclock = pclock;
 			return dp->mode.bw_code;
@@ -692,7 +750,7 @@ static void zynqmp_dp_adjust_train(struct zynqmp_dp *dp,
 static int zynqmp_dp_update_vs_emph(struct zynqmp_dp *dp)
 {
 	u8 *train_set = dp->train_set;
-	u8 i, v_level, p_level;
+	u8 i;
 	int ret;
 
 	ret = drm_dp_dpcd_write(&dp->aux, DP_TRAINING_LANE0_SET, train_set,
@@ -702,14 +760,15 @@ static int zynqmp_dp_update_vs_emph(struct zynqmp_dp *dp)
 
 	for (i = 0; i < dp->mode.lane_cnt; i++) {
 		u32 reg = ZYNQMP_DP_SUB_TX_PHY_PRECURSOR_LANE_0 + i * 4;
+		union phy_configure_opts opts = { 0 };
+		u8 train = dp->train_set[i];
 
-		v_level = (train_set[i] & DP_TRAIN_VOLTAGE_SWING_MASK) >>
-			  DP_TRAIN_VOLTAGE_SWING_SHIFT;
-		p_level = (train_set[i] & DP_TRAIN_PRE_EMPHASIS_MASK) >>
-			  DP_TRAIN_PRE_EMPHASIS_SHIFT;
+		opts.dp.voltage[0] = (train & DP_TRAIN_VOLTAGE_SWING_MASK)
+				   >> DP_TRAIN_VOLTAGE_SWING_SHIFT;
+		opts.dp.pre[0] = (train & DP_TRAIN_PRE_EMPHASIS_MASK)
+			       >> DP_TRAIN_PRE_EMPHASIS_SHIFT;
 
-		xpsgtr_margining_factor(dp->phy[i], p_level, v_level);
-		xpsgtr_override_deemph(dp->phy[i], p_level, v_level);
+		phy_configure(dp->phy[i], &opts);
 		zynqmp_dp_write(dp->iomem, reg, 0x2);
 	}
 
@@ -833,7 +892,7 @@ static int zynqmp_dp_link_train_ce(struct zynqmp_dp *dp)
 }
 
 /**
- * zynqmp_dp_link_train - Train the link
+ * zynqmp_dp_train - Train the link
  * @dp: DisplayPort IP core structure
  *
  * Return: 0 if all trains are done successfully, or corresponding error code.
@@ -903,7 +962,7 @@ static int zynqmp_dp_train(struct zynqmp_dp *dp)
 		return ret;
 
 	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_SCRAMBLING_DISABLE, 1);
-	memset(dp->train_set, 0, 4);
+	memset(dp->train_set, 0, ARRAY_SIZE(dp->train_set));
 	ret = zynqmp_dp_link_train_cr(dp);
 	if (ret)
 		return ret;
@@ -1249,7 +1308,7 @@ static u8 zynqmp_dp_get_bpc(struct zynqmp_dp *dp)
  * @dp: DisplayPort IP core structure
  * @mode: requested display mode
  *
- * Set the transfer unit, and caculate all transfer unit size related values.
+ * Set the transfer unit, and calculate all transfer unit size related values.
  * Calculation is based on DP and IP core specification.
  */
 static void
@@ -1366,11 +1425,17 @@ zynqmp_dp_connector_detect(struct drm_connector *connector, bool force)
 	}
 
 	if (state & ZYNQMP_DP_TX_INTR_SIGNAL_STATE_HPD) {
+		dp->status = connector_status_connected;
 		ret = drm_dp_dpcd_read(&dp->aux, 0x0, dp->dpcd,
 				       sizeof(dp->dpcd));
 		if (ret < 0) {
-			dev_dbg(dp->dev, "DPCD read failes");
-			goto disconnected;
+			dev_dbg(dp->dev, "DPCD read first try fails");
+			ret = drm_dp_dpcd_read(&dp->aux, 0x0, dp->dpcd,
+					       sizeof(dp->dpcd));
+			if (ret < 0) {
+				dev_dbg(dp->dev, "DPCD read retry fails");
+				goto disconnected;
+			}
 		}
 
 		link_config->max_rate = min_t(int,
@@ -1380,7 +1445,6 @@ zynqmp_dp_connector_detect(struct drm_connector *connector, bool force)
 					       drm_dp_max_lane_count(dp->dpcd),
 					       dp->num_lanes);
 
-		dp->status = connector_status_connected;
 		return connector_status_connected;
 	}
 
@@ -1399,7 +1463,7 @@ static int zynqmp_dp_connector_get_modes(struct drm_connector *connector)
 	if (!edid)
 		return 0;
 
-	drm_mode_connector_update_edid_property(connector, edid);
+	drm_connector_update_edid_property(connector, edid);
 	ret = drm_add_edid_modes(connector, edid);
 	kfree(edid);
 
@@ -1455,7 +1519,6 @@ zynqmp_dp_connector_atomic_set_property(struct drm_connector *connector,
 					uint64_t val)
 {
 	struct zynqmp_dp *dp = connector_to_dp(connector);
-	int ret;
 
 	if (property == dp->sync_prop) {
 		zynqmp_dp_set_sync_mode(dp, val);
@@ -1466,7 +1529,7 @@ zynqmp_dp_connector_atomic_set_property(struct drm_connector *connector,
 		if (bpc) {
 			drm_object_property_set_value(&connector->base,
 						      property, bpc);
-			ret = -EINVAL;
+			return -EINVAL;
 		}
 	} else {
 		return -EINVAL;
@@ -1521,7 +1584,12 @@ static void zynqmp_dp_encoder_enable(struct drm_encoder *encoder)
 	unsigned int i;
 	int ret = 0;
 
-	pm_runtime_get_sync(dp->dev);
+	ret = pm_runtime_get_sync(dp->dev);
+	if (ret < 0) {
+		dev_err(dp->dev, "IRQ sync failed to resume: %d\n", ret);
+		return;
+	}
+
 	dp->enabled = true;
 	zynqmp_dp_init_aux(dp);
 	zynqmp_dp_update_misc(dp);
@@ -1552,11 +1620,17 @@ static void zynqmp_dp_encoder_disable(struct drm_encoder *encoder)
 {
 	struct zynqmp_dp *dp = encoder_to_dp(encoder);
 	void __iomem *iomem = dp->iomem;
+	int ret;
 
 	dp->enabled = false;
 	cancel_delayed_work(&dp->hpd_work);
 	zynqmp_dp_write(iomem, ZYNQMP_DP_TX_ENABLE_MAIN_STREAM, 0);
-	drm_dp_dpcd_writeb(&dp->aux, DP_SET_POWER, DP_SET_POWER_D3);
+	ret = drm_dp_dpcd_writeb(&dp->aux, DP_SET_POWER, DP_SET_POWER_D3);
+	if (ret < 0) {
+		dev_err(dp->dev, "failed to write a byte to the DPCD: %d\n",
+			ret);
+		return;
+	}
 	zynqmp_dp_write(iomem, ZYNQMP_DP_TX_PHY_POWER_DOWN,
 			ZYNQMP_DP_TX_PHY_POWER_DOWN_ALL);
 	if (zynqmp_disp_aud_enabled(dp->dpsub->disp))
@@ -1599,24 +1673,21 @@ zynqmp_dp_encoder_atomic_check(struct drm_encoder *encoder,
 			       struct drm_crtc_state *crtc_state,
 			       struct drm_connector_state *conn_state)
 {
-	struct drm_display_mode *mode = &crtc_state->mode;
 	struct drm_display_mode *adjusted_mode = &crtc_state->adjusted_mode;
-	int diff = mode->htotal - mode->hsync_end;
+	int diff = adjusted_mode->htotal - adjusted_mode->hsync_end;
 
 	/*
 	 * ZynqMP DP requires horizontal backporch to be greater than 12.
 	 * This limitation may not be compatible with the sink device.
 	 */
 	if (diff < ZYNQMP_DP_MIN_H_BACKPORCH) {
-		int vrefresh = (adjusted_mode->clock * 1000) /
-			       (adjusted_mode->vtotal * adjusted_mode->htotal);
-
 		dev_dbg(encoder->dev->dev, "hbackporch adjusted: %d to %d",
 			diff, ZYNQMP_DP_MIN_H_BACKPORCH - diff);
 		diff = ZYNQMP_DP_MIN_H_BACKPORCH - diff;
 		adjusted_mode->htotal += diff;
-		adjusted_mode->clock = adjusted_mode->vtotal *
-				       adjusted_mode->htotal * vrefresh / 1000;
+		adjusted_mode->clock = (adjusted_mode->clock *
+					adjusted_mode->htotal) /
+				       (adjusted_mode->htotal - diff);
 	}
 
 	return 0;
@@ -1661,19 +1732,16 @@ int zynqmp_dp_bind(struct device *dev, struct device *master, void *data)
 	struct drm_encoder *encoder = &dp->encoder;
 	struct drm_connector *connector = &dp->connector;
 	struct drm_device *drm = data;
-	struct device_node *port;
 	int ret;
 
 	if (!dp->num_lanes)
 		return 0;
 
 	encoder->possible_crtcs |= zynqmp_disp_get_crtc_mask(dpsub->disp);
-	for_each_child_of_node(dev->of_node, port) {
-		if (!port->name || of_node_cmp(port->name, "port"))
-			continue;
-		encoder->possible_crtcs |= drm_of_find_possible_crtcs(drm,
-								      port);
-	}
+	if (dpsub->external_crtc_attached)
+		encoder->possible_crtcs |=
+			drm_of_find_possible_crtcs(drm, dev->of_node);
+
 	drm_encoder_init(drm, encoder, &zynqmp_dp_encoder_funcs,
 			 DRM_MODE_ENCODER_TMDS, NULL);
 	drm_encoder_helper_add(encoder, &zynqmp_dp_encoder_helper_funcs);
@@ -1689,7 +1757,7 @@ int zynqmp_dp_bind(struct device *dev, struct device *master, void *data)
 
 	drm_connector_helper_add(connector, &zynqmp_dp_connector_helper_funcs);
 	drm_connector_register(connector);
-	drm_mode_connector_attach_encoder(connector, encoder);
+	drm_connector_attach_encoder(connector, encoder);
 	connector->dpms = DRM_MODE_DPMS_OFF;
 
 	dp->drm = drm;
@@ -1705,13 +1773,14 @@ int zynqmp_dp_bind(struct device *dev, struct device *master, void *data)
 				   ret ? ret : 8);
 	zynqmp_dp_update_bpp(dp);
 
+	INIT_DELAYED_WORK(&dp->hpd_work, zynqmp_dp_hpd_work_func);
+
 	/* This enables interrupts, so should be called after DRM init */
 	ret = zynqmp_dp_init_aux(dp);
 	if (ret) {
 		dev_err(dp->dev, "failed to initialize DP aux");
 		goto error_prop;
 	}
-	INIT_DELAYED_WORK(&dp->hpd_work, zynqmp_dp_hpd_work_func);
 
 	return 0;
 
@@ -1764,7 +1833,8 @@ static irqreturn_t zynqmp_dp_irq_handler(int irq, void *data)
 	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_SUB_TX_INTR_STATUS, status);
 
 	/* The DP vblank will not be enabled with remote crtc device */
-	if (status & ZYNQMP_DP_TX_INTR_VBLANK_START)
+	if (status & ZYNQMP_DP_TX_INTR_VBLANK_START &&
+	    !dp->dpsub->external_crtc_attached)
 		zynqmp_disp_handle_vblank(dp->dpsub->disp);
 
 	if (status & ZYNQMP_DP_TX_INTR_HPD_EVENT)
@@ -1772,16 +1842,18 @@ static irqreturn_t zynqmp_dp_irq_handler(int irq, void *data)
 
 	if (status & ZYNQMP_DP_TX_INTR_HPD_IRQ) {
 		int ret;
-		u8 status[DP_LINK_STATUS_SIZE + 2];
+		u8 buf[DP_LINK_STATUS_SIZE + 2];
 
-		ret = drm_dp_dpcd_read(&dp->aux, DP_SINK_COUNT, status,
+		memset(buf, 0, ARRAY_SIZE(buf));
+
+		ret = drm_dp_dpcd_read(&dp->aux, DP_SINK_COUNT, buf,
 				       DP_LINK_STATUS_SIZE + 2);
 		if (ret < 0)
 			goto handled;
 
-		if (status[4] & DP_LINK_STATUS_UPDATED ||
-		    !drm_dp_clock_recovery_ok(&status[2], dp->mode.lane_cnt) ||
-		    !drm_dp_channel_eq_ok(&status[2], dp->mode.lane_cnt)) {
+		if (buf[4] & DP_LINK_STATUS_UPDATED ||
+		    !drm_dp_clock_recovery_ok(&buf[2], dp->mode.lane_cnt) ||
+		    !drm_dp_channel_eq_ok(&buf[2], dp->mode.lane_cnt)) {
 			zynqmp_dp_train_loop(dp);
 		}
 	}
@@ -1795,7 +1867,7 @@ int zynqmp_dp_probe(struct platform_device *pdev)
 	struct zynqmp_dpsub *dpsub;
 	struct zynqmp_dp *dp;
 	struct resource *res;
-	unsigned int i;
+	struct device_node *port;
 	int irq, ret;
 
 	dp = devm_kzalloc(&pdev->dev, sizeof(*dp), GFP_KERNEL);
@@ -1818,41 +1890,11 @@ int zynqmp_dp_probe(struct platform_device *pdev)
 	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_FORCE_SCRAMBLER_RESET, 1);
 	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_ENABLE, 0);
 
-	dp->num_lanes = 2;
-	for (i = 0; i < ZYNQMP_DP_MAX_LANES; i++) {
-		char phy_name[16];
+	ret = zynqmp_dp_phy_probe(dp);
+	if (ret)
+		return ret;
 
-		snprintf(phy_name, sizeof(phy_name), "dp-phy%d", i);
-		dp->phy[i] = devm_phy_get(dp->dev, phy_name);
-		if (IS_ERR(dp->phy[i])) {
-			ret = PTR_ERR(dp->phy[i]);
-			dp->phy[i] = NULL;
-
-			/* 2nd lane is optional */
-			if (i == 1 && ret == -ENODEV) {
-				dp->num_lanes = 1;
-				break;
-			}
-
-			/*
-			 * If no phy lane is assigned, the DP Tx gets disabled.
-			 * The display part of the DP subsystem can still be
-			 * used to drive the output to FPGA, thus let the DP
-			 * subsystem driver to proceed without this DP Tx.
-			 */
-			if (i == 0 && ret == -ENODEV) {
-				dp->num_lanes = 0;
-				goto out;
-			}
-
-			if (ret != -EPROBE_DEFER)
-				dev_err(dp->dev, "failed to get phy lane\n");
-
-			return ret;
-		}
-	}
-
-	ret = zynqmp_dp_init_phy(dp);
+	ret = zynqmp_dp_phy_init(dp);
 	if (ret)
 		goto error_phy;
 
@@ -1865,7 +1907,6 @@ int zynqmp_dp_probe(struct platform_device *pdev)
 		goto error;
 	}
 
-out:
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0) {
 		ret = irq;
@@ -1883,6 +1924,14 @@ out:
 	dpsub->dp = dp;
 	dp->dpsub = dpsub;
 
+	for_each_child_of_node(pdev->dev.of_node, port) {
+		if (!port->name || of_node_cmp(port->name, "port"))
+			continue;
+
+		dpsub->external_crtc_attached = true;
+		break;
+	}
+
 	dev_dbg(dp->dev,
 		"ZynqMP DisplayPort Tx driver probed with %u phy lanes\n",
 		dp->num_lanes);
@@ -1892,7 +1941,7 @@ out:
 error:
 	drm_dp_aux_unregister(&dp->aux);
 error_phy:
-	zynqmp_dp_exit_phy(dp);
+	zynqmp_dp_phy_exit(dp);
 	return ret;
 }
 
@@ -1903,7 +1952,7 @@ int zynqmp_dp_remove(struct platform_device *pdev)
 
 	zynqmp_dp_write(dp->iomem, ZYNQMP_DP_TX_ENABLE, 0);
 	drm_dp_aux_unregister(&dp->aux);
-	zynqmp_dp_exit_phy(dp);
+	zynqmp_dp_phy_exit(dp);
 	dpsub->dp = NULL;
 
 	return 0;

@@ -22,11 +22,11 @@
 #include "xilinx-gamma-coeff.h"
 #include "xilinx-vip.h"
 
-#define XGAMMA_MIN_HEIGHT	(32)
-#define XGAMMA_MAX_HEIGHT	(2160)
+#define XGAMMA_MIN_HEIGHT	(64)
+#define XGAMMA_MAX_HEIGHT	(4320)
 #define XGAMMA_DEF_HEIGHT	(720)
-#define XGAMMA_MIN_WIDTH	(32)
-#define XGAMMA_MAX_WIDTH	(3840)
+#define XGAMMA_MIN_WIDTH	(64)
+#define XGAMMA_MAX_WIDTH	(8192)
 #define XGAMMA_DEF_WIDTH	(1280)
 
 #define XGAMMA_AP_CTRL			(0x0000)
@@ -63,6 +63,8 @@ enum xgamma_video_format {
  * @color_depth: Color depth of the Video Gamma IP
  * @gamma_table: Pointer to the table containing various gamma values
  * @rst_gpio: GPIO reset line to bring VPSS Scaler out of reset
+ * @max_width: Maximum width supported by this instance.
+ * @max_height: Maximum height supported by this instance.
  */
 struct xgamma_dev {
 	struct xvip_device xvip;
@@ -77,6 +79,8 @@ struct xgamma_dev {
 	u32 color_depth;
 	const u16 **gamma_table;
 	struct gpio_desc *rst_gpio;
+	u32 max_width;
+	u32 max_height;
 };
 
 static inline u32 xg_read(struct xgamma_dev *xg, u32 reg)
@@ -111,15 +115,22 @@ __xg_get_pad_format(struct xgamma_dev *xg,
 		    struct v4l2_subdev_pad_config *cfg,
 		    unsigned int pad, u32 which)
 {
+	struct v4l2_mbus_framefmt *format;
+
 	switch (which) {
 	case V4L2_SUBDEV_FORMAT_TRY:
-		return v4l2_subdev_get_try_format(
-					&xg->xvip.subdev, cfg, pad);
+		format = v4l2_subdev_get_try_format(&xg->xvip.subdev, cfg,
+						    pad);
+		break;
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
-		return &xg->formats[pad];
+		format = &xg->formats[pad];
+		break;
 	default:
-		return NULL;
+		format = NULL;
+		break;
 	}
+
+	return format;
 }
 
 static void xg_set_lut_entries(struct xgamma_dev *xg,
@@ -173,8 +184,14 @@ static int xg_get_format(struct v4l2_subdev *subdev,
 			 struct v4l2_subdev_format *fmt)
 {
 	struct xgamma_dev *xg = to_xg(subdev);
+	struct v4l2_mbus_framefmt *format;
 
-	fmt->format = *__xg_get_pad_format(xg, cfg, fmt->pad, fmt->which);
+	format = __xg_get_pad_format(xg, cfg, fmt->pad, fmt->which);
+	if (!format)
+		return -EINVAL;
+
+	fmt->format = *format;
+
 	return 0;
 }
 
@@ -186,6 +203,9 @@ static int xg_set_format(struct v4l2_subdev *subdev,
 	struct v4l2_mbus_framefmt *__format;
 
 	__format = __xg_get_pad_format(xg, cfg, fmt->pad, fmt->which);
+	if (!__format)
+		return -EINVAL;
+
 	*__format = fmt->format;
 
 	if (fmt->pad == XVIP_PAD_SINK) {
@@ -196,13 +216,16 @@ static int xg_set_format(struct v4l2_subdev *subdev,
 		}
 	}
 	__format->width = clamp_t(unsigned int, fmt->format.width,
-					XGAMMA_MIN_WIDTH, XGAMMA_MAX_WIDTH);
+				  XGAMMA_MIN_WIDTH, xg->max_width);
 	__format->height = clamp_t(unsigned int, fmt->format.height,
-					XGAMMA_MIN_HEIGHT, XGAMMA_MAX_HEIGHT);
+				   XGAMMA_MIN_HEIGHT, xg->max_height);
 
 	fmt->format = *__format;
 	/* Propagate to Source Pad */
 	__format = __xg_get_pad_format(xg, cfg, XVIP_PAD_SOURCE, fmt->which);
+	if (!__format)
+		return -EINVAL;
+
 	*__format = fmt->format;
 	return 0;
 }
@@ -352,6 +375,26 @@ static int xg_parse_of(struct xgamma_dev *xg)
 	u32 port_id = 0;
 	int rval;
 
+	rval = of_property_read_u32(node, "xlnx,max-height", &xg->max_height);
+	if (rval < 0) {
+		dev_err(dev, "xlnx,max-height is missing!");
+		return -EINVAL;
+	} else if (xg->max_height > XGAMMA_MAX_HEIGHT ||
+		   xg->max_height < XGAMMA_MIN_HEIGHT) {
+		dev_err(dev, "Invalid height in dt");
+		return -EINVAL;
+	}
+
+	rval = of_property_read_u32(node, "xlnx,max-width", &xg->max_width);
+	if (rval < 0) {
+		dev_err(dev, "xlnx,max-width is missing!");
+		return -EINVAL;
+	} else if (xg->max_width > XGAMMA_MAX_WIDTH ||
+		   xg->max_width < XGAMMA_MIN_WIDTH) {
+		dev_err(dev, "Invalid width in dt");
+		return -EINVAL;
+	}
+
 	ports = of_get_child_by_name(node, "ports");
 	if (!ports)
 		ports = node;
@@ -415,6 +458,8 @@ static int xg_probe(struct platform_device *pdev)
 	if (rval < 0)
 		return rval;
 	rval = xvip_init_resources(&xg->xvip);
+	if (rval)
+		return -EIO;
 
 	dev_dbg(xg->xvip.dev, "Reset Xilinx Video Gamma Corrrection");
 	gpiod_set_value_cansleep(xg->rst_gpio, XGAMMA_RESET_DEASSERT);

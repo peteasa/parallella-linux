@@ -16,40 +16,31 @@
 
 /*  ----------------------------------- Host OS */
 
+#include <asm/cacheflush.h>
+
+#include <linux/cdev.h>
+#include <linux/completion.h>
+#include <linux/device.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-map-ops.h>
+#include <linux/dma-mapping.h>
+#include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/gfp.h>
+#include <linux/io.h>
+#include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/module.h>
-#include <linux/types.h>
+#include <linux/of.h>
+#include <linux/pagemap.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
-#include <linux/fs.h>
-#include <linux/slab.h>
-#include <linux/gfp.h>
-#include <linux/mm.h>
-#include <asm/cacheflush.h>
-#include <linux/io.h>
-#include <linux/dma-buf.h>
-
-#include <linux/string.h>
-
-#include <linux/uaccess.h>
-
-#include <linux/dmaengine.h>
-#include <linux/completion.h>
-#include <linux/wait.h>
-
-#include <linux/device.h>
-#include <linux/init.h>
-#include <linux/cdev.h>
-
 #include <linux/sched.h>
-#include <linux/pagemap.h>
-#include <linux/errno.h>	/* error codes */
-#include <linux/dma-mapping.h>  /* dma */
-#include <linux/of.h>
-#include <linux/list.h>
-#include <linux/dma/xilinx_dma.h>
-#include <linux/uio_driver.h>
-#include <asm/cacheflush.h>
 #include <linux/semaphore.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
 
 #include "xlnk-ioctl.h"
 #include "xlnk-sysdef.h"
@@ -60,7 +51,6 @@
 #endif
 
 #define DRIVER_NAME  "xlnk"
-#define DRIVER_VERSION  "0.2"
 
 static struct platform_device *xlnk_pdev;
 static struct device *xlnk_dev;
@@ -71,14 +61,10 @@ static struct class *xlnk_class;
 
 static s32 driver_major;
 
-static char *driver_name = DRIVER_NAME;
-
 static void *xlnk_dev_buf;
 static ssize_t xlnk_dev_size;
-static int xlnk_dev_vmas;
 
 #define XLNK_BUF_POOL_SIZE	4096
-static unsigned int xlnk_bufpool_size = XLNK_BUF_POOL_SIZE;
 static void *xlnk_bufpool[XLNK_BUF_POOL_SIZE];
 static void *xlnk_bufpool_alloc_point[XLNK_BUF_POOL_SIZE];
 static xlnk_intptr_type xlnk_userbuf[XLNK_BUF_POOL_SIZE];
@@ -86,35 +72,14 @@ static int xlnk_buf_process[XLNK_BUF_POOL_SIZE];
 static dma_addr_t xlnk_phyaddr[XLNK_BUF_POOL_SIZE];
 static size_t xlnk_buflen[XLNK_BUF_POOL_SIZE];
 static unsigned int xlnk_bufcacheable[XLNK_BUF_POOL_SIZE];
+static struct file *xlnk_buf_filp[XLNK_BUF_POOL_SIZE];
 static spinlock_t xlnk_buf_lock;
 
-static int xlnk_open(struct inode *ip, struct file *filp);
-static int xlnk_release(struct inode *ip, struct file *filp);
-static long xlnk_ioctl(struct file *filp, unsigned int code,
-		       unsigned long args);
-static ssize_t xlnk_read(struct file *filp, char __user *buf,
-			 size_t count, loff_t *offp);
-static ssize_t xlnk_write(struct file *filp, const char __user *buf,
-			  size_t count, loff_t *offp);
-static int xlnk_mmap(struct file *filp, struct vm_area_struct *vma);
-static void xlnk_vma_open(struct vm_area_struct *vma);
-static void xlnk_vma_close(struct vm_area_struct *vma);
-
-static int xlnk_init_bufpool(void);
+#define XLNK_IRQ_POOL_SIZE 256
+static struct xlnk_irq_control *xlnk_irq_set[XLNK_IRQ_POOL_SIZE];
+static spinlock_t xlnk_irq_lock;
 
 LIST_HEAD(xlnk_dmabuf_list);
-
-static int xlnk_shutdown(unsigned long buf);
-static int xlnk_recover_resource(unsigned long buf);
-
-static const struct file_operations xlnk_fops = {
-	.open = xlnk_open,
-	.release = xlnk_release,
-	.read = xlnk_read,
-	.write = xlnk_write,
-	.unlocked_ioctl = xlnk_ioctl,
-	.mmap = xlnk_mmap,
-};
 
 #define MAX_XLNK_DMAS 128
 
@@ -122,7 +87,6 @@ struct xlnk_device_pack {
 	char name[64];
 	struct platform_device pdev;
 	struct resource res[8];
-	struct uio_info *io_ptr;
 	int refs;
 
 #ifdef CONFIG_XILINX_DMA_APF
@@ -212,88 +176,18 @@ static void xlnk_devpacks_free_all(void)
 	for (i = 0; i < MAX_XLNK_DMAS; i++) {
 		devpack = xlnk_devpacks[i];
 		if (devpack) {
-			if (devpack->io_ptr) {
-				uio_unregister_device(devpack->io_ptr);
-				kfree(devpack->io_ptr);
-			} else {
-				platform_device_unregister(&devpack->pdev);
-			}
+			platform_device_unregister(&devpack->pdev);
 			xlnk_devpacks_delete(devpack);
 			kfree(devpack);
 		}
 	}
 }
 
-static int xlnk_probe(struct platform_device *pdev)
-{
-	int err;
-	dev_t dev = 0;
-
-	xlnk_dev_buf = NULL;
-	xlnk_dev_size = 0;
-	xlnk_dev_vmas = 0;
-
-	/* use 2.6 device model */
-	err = alloc_chrdev_region(&dev, 0, 1, driver_name);
-	if (err) {
-		dev_err(&pdev->dev, "%s: Can't get major %d\n",
-			__func__, driver_major);
-		goto err1;
-	}
-
-	cdev_init(&xlnk_cdev, &xlnk_fops);
-
-	xlnk_cdev.owner = THIS_MODULE;
-
-	err = cdev_add(&xlnk_cdev, dev, 1);
-
-	if (err) {
-		dev_err(&pdev->dev, "%s: Failed to add XLNK device\n",
-			__func__);
-		goto err3;
-	}
-
-	/* udev support */
-	xlnk_class = class_create(THIS_MODULE, "xlnk");
-	if (IS_ERR(xlnk_class)) {
-		dev_err(xlnk_dev, "%s: Error creating xlnk class\n", __func__);
-		goto err3;
-	}
-
-	driver_major = MAJOR(dev);
-
-	dev_info(&pdev->dev, "Major %d\n", driver_major);
-
-	device_create(xlnk_class, NULL, MKDEV(driver_major, 0),
-		      NULL, "xlnk");
-
-	xlnk_init_bufpool();
-
-	dev_info(&pdev->dev, "%s driver loaded\n", DRIVER_NAME);
-
-	xlnk_pdev = pdev;
-	xlnk_dev = &pdev->dev;
-
-	if (xlnk_pdev)
-		dev_info(&pdev->dev, "xlnk_pdev is not null\n");
-	else
-		dev_info(&pdev->dev, "xlnk_pdev is null\n");
-
-	xlnk_devpacks_init();
-
-	return 0;
-err3:
-	cdev_del(&xlnk_cdev);
-	unregister_chrdev_region(dev, 1);
-err1:
-	return err;
-}
-
 static int xlnk_buf_findnull(void)
 {
 	int i;
 
-	for (i = 1; i < xlnk_bufpool_size; i++) {
+	for (i = 1; i < XLNK_BUF_POOL_SIZE; i++) {
 		if (!xlnk_bufpool[i])
 			return i;
 	}
@@ -305,7 +199,7 @@ static int xlnk_buf_find_by_phys_addr(xlnk_intptr_type addr)
 {
 	int i;
 
-	for (i = 1; i < xlnk_bufpool_size; i++) {
+	for (i = 1; i < XLNK_BUF_POOL_SIZE; i++) {
 		if (xlnk_bufpool[i] &&
 		    xlnk_phyaddr[i] <= addr &&
 		    xlnk_phyaddr[i] + xlnk_buflen[i] > addr)
@@ -319,7 +213,7 @@ static int xlnk_buf_find_by_user_addr(xlnk_intptr_type addr, int pid)
 {
 	int i;
 
-	for (i = 1; i < xlnk_bufpool_size; i++) {
+	for (i = 1; i < XLNK_BUF_POOL_SIZE; i++) {
 		if (xlnk_bufpool[i] &&
 		    xlnk_buf_process[i] == pid &&
 		    xlnk_userbuf[i] <= addr &&
@@ -330,24 +224,22 @@ static int xlnk_buf_find_by_user_addr(xlnk_intptr_type addr, int pid)
 	return 0;
 }
 
-/**
+/*
  * allocate and return an id
  * id must be a positve number
  */
-static int xlnk_allocbuf(unsigned int len, unsigned int cacheable)
+static int xlnk_allocbuf(struct file *filp, unsigned int len,
+			 unsigned int cacheable)
 {
 	int id;
 	void *kaddr;
 	dma_addr_t phys_addr_anchor;
-	unsigned long attrs;
-
-	attrs = cacheable ? DMA_ATTR_NON_CONSISTENT : 0;
 
 	kaddr = dma_alloc_attrs(xlnk_dev,
 				len,
 				&phys_addr_anchor,
 				GFP_KERNEL | GFP_DMA,
-				attrs);
+				0);
 	if (!kaddr)
 		return -ENOMEM;
 
@@ -359,6 +251,7 @@ static int xlnk_allocbuf(unsigned int len, unsigned int cacheable)
 		xlnk_buflen[id] = len;
 		xlnk_bufcacheable[id] = cacheable;
 		xlnk_phyaddr[id] = phys_addr_anchor;
+		xlnk_buf_filp[id] = filp;
 	}
 	spin_unlock(&xlnk_buf_lock);
 
@@ -368,132 +261,7 @@ static int xlnk_allocbuf(unsigned int len, unsigned int cacheable)
 	return id;
 }
 
-static int xlnk_init_bufpool(void)
-{
-	unsigned int i;
-
-	spin_lock_init(&xlnk_buf_lock);
-	xlnk_dev_buf = kmalloc(8192, GFP_KERNEL | GFP_DMA);
-	*((char *)xlnk_dev_buf) = '\0';
-
-	if (!xlnk_dev_buf) {
-		dev_err(xlnk_dev, "%s: malloc failed\n", __func__);
-		return -ENOMEM;
-	}
-
-	xlnk_bufpool[0] = xlnk_dev_buf;
-	for (i = 1; i < xlnk_bufpool_size; i++)
-		xlnk_bufpool[i] = NULL;
-
-	return 0;
-}
-
-#define XLNK_SUSPEND NULL
-#define XLNK_RESUME NULL
-
-static int xlnk_remove(struct platform_device *pdev)
-{
-	dev_t devno;
-
-	kfree(xlnk_dev_buf);
-	xlnk_dev_buf = NULL;
-
-	devno = MKDEV(driver_major, 0);
-	cdev_del(&xlnk_cdev);
-	unregister_chrdev_region(devno, 1);
-	if (xlnk_class) {
-		/* remove the device from sysfs */
-		device_destroy(xlnk_class, MKDEV(driver_major, 0));
-		class_destroy(xlnk_class);
-	}
-
-	xlnk_devpacks_free_all();
-
-	return 0;
-}
-
-static const struct of_device_id xlnk_match[] = {
-	{ .compatible = "xlnx,xlnk-1.0", },
-	{}
-};
-MODULE_DEVICE_TABLE(of, xlnk_match);
-
-static struct platform_driver xlnk_driver = {
-	.driver = {
-		.name = DRIVER_NAME,
-		.of_match_table = xlnk_match,
-	},
-	.probe = xlnk_probe,
-	.remove = xlnk_remove,
-	.suspend = XLNK_SUSPEND,
-	.resume = XLNK_RESUME,
-};
-
 static u64 dma_mask = 0xFFFFFFFFFFFFFFFFull;
-
-/*
- * This function is called when an application opens handle to the
- * bridge driver.
- */
-static int xlnk_open(struct inode *ip, struct file *filp)
-{
-	if ((filp->f_flags & O_ACCMODE) == O_WRONLY)
-		xlnk_dev_size = 0;
-
-	return 0;
-}
-
-static ssize_t xlnk_read(struct file *filp,
-			 char __user *buf,
-			 size_t count,
-			 loff_t *offp)
-{
-	ssize_t retval = 0;
-
-	if (*offp >= xlnk_dev_size)
-		goto out;
-
-	if (*offp + count > xlnk_dev_size)
-		count = xlnk_dev_size - *offp;
-
-	if (copy_to_user(buf, xlnk_dev_buf + *offp, count)) {
-		retval = -EFAULT;
-		goto out;
-	}
-	*offp += count;
-	retval = count;
-
- out:
-	return retval;
-}
-
-static ssize_t xlnk_write(struct file *filp, const char __user *buf,
-			  size_t count, loff_t *offp)
-{
-	ssize_t retval = 0;
-
-	if (copy_from_user(xlnk_dev_buf + *offp, buf, count)) {
-		retval = -EFAULT;
-		goto out;
-	}
-	*offp += count;
-	retval = count;
-
-	if (xlnk_dev_size < *offp)
-		xlnk_dev_size = *offp;
-
- out:
-	return retval;
-}
-
-/*
- * This function is called when an application closes handle to the bridge
- * driver.
- */
-static int xlnk_release(struct inode *ip, struct file *filp)
-{
-	return 0;
-}
 
 static int xlnk_devregister(char *name,
 			    unsigned int id,
@@ -537,7 +305,6 @@ static int xlnk_devregister(char *name,
 			pr_err("Failed to allocate device %s\n", name);
 			return -ENOMEM;
 		}
-		devpack->io_ptr = NULL;
 		strcpy(devpack->name, name);
 		devpack->pdev.name = devpack->name;
 
@@ -614,8 +381,6 @@ static int xlnk_dmaregister(char *name,
 		strcpy(devpack->name, name);
 		devpack->pdev.name = "xilinx-axidma";
 
-		devpack->io_ptr = NULL;
-
 		devpack->dma_chan_cfg[0].include_dre = chan0_include_dre;
 		devpack->dma_chan_cfg[0].datawidth = chan0_data_width;
 		devpack->dma_chan_cfg[0].irq = chan0_irq;
@@ -683,7 +448,7 @@ static int xlnk_allocbuf_ioctl(struct file *filp,
 	if (status)
 		return -ENOMEM;
 
-	id = xlnk_allocbuf(temp_args.allocbuf.len,
+	id = xlnk_allocbuf(filp, temp_args.allocbuf.len,
 			   temp_args.allocbuf.cacheable);
 
 	if (id <= 0)
@@ -703,10 +468,8 @@ static int xlnk_freebuf(int id)
 	void *alloc_point;
 	dma_addr_t p_addr;
 	size_t buf_len;
-	int cacheable;
-	unsigned long attrs;
 
-	if (id <= 0 || id >= xlnk_bufpool_size)
+	if (id <= 0 || id >= XLNK_BUF_POOL_SIZE)
 		return -ENOMEM;
 
 	if (!xlnk_bufpool[id])
@@ -719,17 +482,15 @@ static int xlnk_freebuf(int id)
 	xlnk_bufpool[id] = NULL;
 	xlnk_phyaddr[id] = (dma_addr_t)NULL;
 	xlnk_buflen[id] = 0;
-	cacheable = xlnk_bufcacheable[id];
+	xlnk_buf_filp[id] = NULL;
 	xlnk_bufcacheable[id] = 0;
 	spin_unlock(&xlnk_buf_lock);
-
-	attrs = cacheable ? DMA_ATTR_NON_CONSISTENT : 0;
 
 	dma_free_attrs(xlnk_dev,
 		       buf_len,
 		       alloc_point,
 		       p_addr,
-		       attrs);
+		       0);
 
 	return 0;
 }
@@ -738,7 +499,7 @@ static void xlnk_free_all_buf(void)
 {
 	int i;
 
-	for (i = 1; i < xlnk_bufpool_size; i++)
+	for (i = 1; i < XLNK_BUF_POOL_SIZE; i++)
 		xlnk_freebuf(i);
 }
 
@@ -949,8 +710,9 @@ static int xlnk_dmasubmit_ioctl(struct file *filp, unsigned int code,
 			return -EFAULT;
 	}
 	return status;
-#endif
+#else
 	return -ENOMEM;
+#endif
 }
 
 static int xlnk_dmawait_ioctl(struct file *filp,
@@ -1082,6 +844,175 @@ static int xlnk_devunregister_ioctl(struct file *filp,
 	xlnk_devpacks_free(temp_args.devunregister.base);
 
 	return 0;
+}
+
+static irqreturn_t xlnk_accel_isr(int irq, void *arg)
+{
+	struct xlnk_irq_control *irq_control = (struct xlnk_irq_control *)arg;
+
+	disable_irq_nosync(irq);
+	complete(&irq_control->cmp);
+
+	return IRQ_HANDLED;
+}
+
+static int xlnk_irq_register_ioctl(struct file *filp, unsigned int code,
+				   unsigned long args)
+{
+	union xlnk_args temp_args;
+	int status;
+	int i;
+	struct xlnk_irq_control *ctrl;
+	int irq_id = -1;
+	int irq_entry_new = 0;
+
+	status = copy_from_user(&temp_args,
+				(void __user *)args,
+				sizeof(temp_args.irqregister));
+	if (status)
+		return -ENOMEM;
+
+	if (temp_args.irqregister.type !=
+	    (XLNK_IRQ_LEVEL | XLNK_IRQ_ACTIVE_HIGH)) {
+		dev_err(xlnk_dev, "Unsupported interrupt type %x\n",
+			temp_args.irqregister.type);
+		return -EINVAL;
+	}
+
+	ctrl = kzalloc(sizeof(*ctrl), GFP_KERNEL);
+	if (!ctrl)
+		return -ENOMEM;
+
+	ctrl->irq = xlate_irq(temp_args.irqregister.irq);
+	ctrl->enabled = 0;
+	init_completion(&ctrl->cmp);
+
+	spin_lock(&xlnk_irq_lock);
+	for (i = 0; i < XLNK_IRQ_POOL_SIZE; i++) {
+		if (!xlnk_irq_set[i] && irq_id == -1) {
+			irq_entry_new = 1;
+			irq_id = i;
+			xlnk_irq_set[i] = ctrl;
+		} else if (xlnk_irq_set[i] &&
+			   xlnk_irq_set[i]->irq == ctrl->irq) {
+			irq_id = i;
+			break;
+		}
+	}
+	spin_unlock(&xlnk_irq_lock);
+
+	if (irq_id == -1) {
+		kfree(ctrl);
+		return -ENOMEM;
+	}
+
+	if (!irq_entry_new) {
+		kfree(ctrl);
+	} else {
+		status = request_irq(ctrl->irq,
+				     xlnk_accel_isr,
+				     IRQF_SHARED,
+				     "xlnk",
+				     ctrl);
+		if (status) {
+			enable_irq(ctrl->irq);
+			xlnk_irq_set[irq_id] = NULL;
+			kfree(ctrl);
+			return -EINVAL;
+		}
+		disable_irq_nosync(ctrl->irq);
+	}
+
+	temp_args.irqregister.irq_id = irq_id;
+
+	status = copy_to_user((void __user *)args,
+			      &temp_args,
+			      sizeof(temp_args.irqregister));
+
+	return status;
+}
+
+static int xlnk_irq_unregister_ioctl(struct file *filp, unsigned int code,
+				     unsigned long args)
+{
+	union xlnk_args temp_args;
+	int status;
+	int irq_id;
+	struct xlnk_irq_control *ctrl;
+
+	status = copy_from_user(&temp_args,
+				(void __user *)args,
+				sizeof(union xlnk_args));
+	if (status)
+		return -ENOMEM;
+
+	irq_id = temp_args.irqunregister.irq_id;
+	if (irq_id < 0 || irq_id >= XLNK_IRQ_POOL_SIZE)
+		return -EINVAL;
+
+	ctrl = xlnk_irq_set[irq_id];
+	if (!ctrl)
+		return -EINVAL;
+
+	xlnk_irq_set[irq_id] = NULL;
+
+	if (ctrl->enabled) {
+		disable_irq_nosync(ctrl->irq);
+		complete(&ctrl->cmp);
+	}
+	free_irq(ctrl->irq, ctrl);
+	kfree(ctrl);
+
+	return 0;
+}
+
+static int xlnk_irq_wait_ioctl(struct file *filp, unsigned int code,
+			       unsigned long args)
+{
+	union xlnk_args temp_args;
+	int status;
+	int irq_id;
+	struct xlnk_irq_control *ctrl;
+
+	status = copy_from_user(&temp_args,
+				(void __user *)args,
+				sizeof(temp_args.irqwait));
+	if (status)
+		return -ENOMEM;
+
+	irq_id = temp_args.irqwait.irq_id;
+	if (irq_id < 0 || irq_id >= XLNK_IRQ_POOL_SIZE)
+		return -EINVAL;
+
+	ctrl = xlnk_irq_set[irq_id];
+	if (!ctrl)
+		return -EINVAL;
+
+	if (!ctrl->enabled) {
+		ctrl->enabled = 1;
+		enable_irq(ctrl->irq);
+	}
+
+	if (temp_args.irqwait.polling) {
+		if (!try_wait_for_completion(&ctrl->cmp))
+			temp_args.irqwait.success = 0;
+		else
+			temp_args.irqwait.success = 1;
+	} else {
+		wait_for_completion(&ctrl->cmp);
+		temp_args.irqwait.success = 1;
+	}
+
+	if (temp_args.irqwait.success) {
+		reinit_completion(&ctrl->cmp);
+		ctrl->enabled = 0;
+	}
+
+	status = copy_to_user((void __user *)args,
+			      &temp_args,
+			      sizeof(temp_args.irqwait));
+
+	return status;
 }
 
 static int xlnk_cachecontrol_ioctl(struct file *filp, unsigned int code,
@@ -1262,6 +1193,20 @@ static int xlnk_memop_ioctl(struct file *filp, unsigned long arg_addr)
 	return status;
 }
 
+static int xlnk_shutdown(unsigned long buf)
+{
+	return 0;
+}
+
+static int xlnk_recover_resource(unsigned long buf)
+{
+	xlnk_free_all_buf();
+#ifdef CONFIG_XILINX_DMA_APF
+	xdma_release_all_channels();
+#endif
+	return 0;
+}
+
 /* This function provides IO interface to the bridge driver. */
 static long xlnk_ioctl(struct file *filp,
 		       unsigned int code,
@@ -1298,6 +1243,12 @@ static long xlnk_ioctl(struct file *filp,
 		return xlnk_devunregister_ioctl(filp, code, args);
 	case XLNK_IOCCACHECTRL:
 		return xlnk_cachecontrol_ioctl(filp, code, args);
+	case XLNK_IOCIRQREGISTER:
+		return xlnk_irq_register_ioctl(filp, code, args);
+	case XLNK_IOCIRQUNREGISTER:
+		return xlnk_irq_unregister_ioctl(filp, code, args);
+	case XLNK_IOCIRQWAIT:
+		return xlnk_irq_wait_ioctl(filp, code, args);
 	case XLNK_IOCSHUTDOWN:
 		return xlnk_shutdown(args);
 	case XLNK_IOCRECRES:
@@ -1308,11 +1259,6 @@ static long xlnk_ioctl(struct file *filp,
 		return -EINVAL;
 	}
 }
-
-static const struct vm_operations_struct xlnk_vm_ops = {
-	.open = xlnk_vma_open,
-	.close = xlnk_vma_close,
-};
 
 /* This function maps kernel space memory to user space memory. */
 static int xlnk_mmap(struct file *filp, struct vm_area_struct *vma)
@@ -1347,36 +1293,226 @@ static int xlnk_mmap(struct file *filp, struct vm_area_struct *vma)
 		return status;
 	}
 
-	xlnk_vma_open(vma);
-	vma->vm_ops = &xlnk_vm_ops;
 	vma->vm_private_data = xlnk_bufpool[bufid];
 
 	return 0;
 }
 
-static void xlnk_vma_open(struct vm_area_struct *vma)
+static ssize_t xlnk_write(struct file *filp, const char __user *buf,
+			  size_t count, loff_t *offp)
 {
-	xlnk_dev_vmas++;
+	ssize_t retval = 0;
+
+	if (copy_from_user(xlnk_dev_buf + *offp, buf, count)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	*offp += count;
+	retval = count;
+
+	if (xlnk_dev_size < *offp)
+		xlnk_dev_size = *offp;
+
+ out:
+	return retval;
 }
 
-static void xlnk_vma_close(struct vm_area_struct *vma)
+static ssize_t xlnk_read(struct file *filp,
+			 char __user *buf,
+			 size_t count,
+			 loff_t *offp)
 {
-	xlnk_dev_vmas--;
+	ssize_t retval = 0;
+
+	if (*offp >= xlnk_dev_size)
+		goto out;
+
+	if (*offp + count > xlnk_dev_size)
+		count = xlnk_dev_size - *offp;
+
+	if (copy_to_user(buf, xlnk_dev_buf + *offp, count)) {
+		retval = -EFAULT;
+		goto out;
+	}
+	*offp += count;
+	retval = count;
+
+ out:
+	return retval;
 }
 
-static int xlnk_shutdown(unsigned long buf)
+/*
+ * This function is called when an application closes handle to the bridge
+ * driver.
+ */
+static int xlnk_release(struct inode *ip, struct file *filp)
 {
+	unsigned int i;
+
+	for (i = 1; i < XLNK_BUF_POOL_SIZE; i++) {
+		if (xlnk_buf_filp[i] == filp)
+			xlnk_freebuf(i);
+	}
+
 	return 0;
 }
 
-static int xlnk_recover_resource(unsigned long buf)
+/*
+ * This function is called when an application opens handle to the
+ * bridge driver.
+ */
+static int xlnk_open(struct inode *ip, struct file *filp)
 {
-	xlnk_free_all_buf();
-#ifdef CONFIG_XILINX_DMA_APF
-	xdma_release_all_channels();
-#endif
+	if ((filp->f_flags & O_ACCMODE) == O_WRONLY)
+		xlnk_dev_size = 0;
+
 	return 0;
 }
+
+static const struct file_operations xlnk_fops = {
+	.open = xlnk_open,
+	.release = xlnk_release,
+	.read = xlnk_read,
+	.write = xlnk_write,
+	.unlocked_ioctl = xlnk_ioctl,
+	.mmap = xlnk_mmap,
+};
+
+static int xlnk_remove(struct platform_device *pdev)
+{
+	dev_t devno;
+
+	kfree(xlnk_dev_buf);
+	xlnk_dev_buf = NULL;
+
+	devno = MKDEV(driver_major, 0);
+	cdev_del(&xlnk_cdev);
+	unregister_chrdev_region(devno, 1);
+	if (xlnk_class) {
+		/* remove the device from sysfs */
+		device_destroy(xlnk_class, MKDEV(driver_major, 0));
+		class_destroy(xlnk_class);
+	}
+
+	xlnk_devpacks_free_all();
+
+	return 0;
+}
+
+static int xlnk_init_bufpool(void)
+{
+	unsigned int i;
+
+	spin_lock_init(&xlnk_buf_lock);
+	xlnk_dev_buf = kmalloc(8192, GFP_KERNEL | GFP_DMA);
+	*((char *)xlnk_dev_buf) = '\0';
+
+	if (!xlnk_dev_buf) {
+		dev_err(xlnk_dev, "%s: malloc failed\n", __func__);
+		return -ENOMEM;
+	}
+
+	xlnk_bufpool[0] = xlnk_dev_buf;
+	for (i = 1; i < XLNK_BUF_POOL_SIZE; i++)
+		xlnk_bufpool[i] = NULL;
+
+	return 0;
+}
+
+static void xlnk_init_irqpool(void)
+{
+	int i;
+
+	spin_lock_init(&xlnk_irq_lock);
+	for (i = 0; i < XLNK_IRQ_POOL_SIZE; i++)
+		xlnk_irq_set[i] = NULL;
+}
+
+static int xlnk_probe(struct platform_device *pdev)
+{
+	int err;
+	dev_t dev = 0;
+
+	xlnk_dev_buf = NULL;
+	xlnk_dev_size = 0;
+
+	/* use 2.6 device model */
+	err = alloc_chrdev_region(&dev, 0, 1, DRIVER_NAME);
+	if (err) {
+		dev_err(&pdev->dev, "%s: Can't get major %d\n",
+			__func__, driver_major);
+		goto err1;
+	}
+
+	cdev_init(&xlnk_cdev, &xlnk_fops);
+
+	xlnk_cdev.owner = THIS_MODULE;
+
+	err = cdev_add(&xlnk_cdev, dev, 1);
+
+	if (err) {
+		dev_err(&pdev->dev, "%s: Failed to add XLNK device\n",
+			__func__);
+		goto err3;
+	}
+
+	/* udev support */
+	xlnk_class = class_create(THIS_MODULE, "xlnk");
+	if (IS_ERR(xlnk_class)) {
+		dev_err(xlnk_dev, "%s: Error creating xlnk class\n", __func__);
+		goto err3;
+	}
+
+	driver_major = MAJOR(dev);
+
+	dev_info(&pdev->dev, "Major %d\n", driver_major);
+
+	device_create(xlnk_class, NULL, MKDEV(driver_major, 0),
+		      NULL, "xlnk");
+
+	err = xlnk_init_bufpool();
+	if (err) {
+		dev_err(&pdev->dev, "%s: Failed to allocate buffer pool\n",
+			__func__);
+		goto err3;
+	}
+
+	xlnk_init_irqpool();
+
+	dev_info(&pdev->dev, "%s driver loaded\n", DRIVER_NAME);
+
+	xlnk_pdev = pdev;
+	xlnk_dev = &pdev->dev;
+
+	if (xlnk_pdev)
+		dev_info(&pdev->dev, "xlnk_pdev is not null\n");
+	else
+		dev_info(&pdev->dev, "xlnk_pdev is null\n");
+
+	xlnk_devpacks_init();
+
+	return 0;
+err3:
+	cdev_del(&xlnk_cdev);
+	unregister_chrdev_region(dev, 1);
+err1:
+	return err;
+}
+
+static const struct of_device_id xlnk_match[] = {
+	{ .compatible = "xlnx,xlnk-1.0", },
+	{}
+};
+MODULE_DEVICE_TABLE(of, xlnk_match);
+
+static struct platform_driver xlnk_driver = {
+	.driver = {
+		.name = DRIVER_NAME,
+		.of_match_table = xlnk_match,
+	},
+	.probe = xlnk_probe,
+	.remove = xlnk_remove,
+};
 
 module_platform_driver(xlnk_driver);
 

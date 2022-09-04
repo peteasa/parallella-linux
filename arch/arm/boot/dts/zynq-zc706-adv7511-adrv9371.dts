@@ -1,7 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Analog Devices ADRV9371
+ * https://wiki.analog.com/resources/tools-software/linux-drivers/iio-transceiver/ad9371
+ * https://wiki.analog.com/resources/eval/user-guides/mykonos
+ *
+ * hdl_project: <adrv9371x/zc706>
+ * board_revision: <>
+ *
+ * Copyright (C) 2016-2019 Analog Devices Inc.
+ */
 /dts-v1/;
 
-/include/ "zynq-zc706.dtsi"
-/include/ "zynq-zc706-adv7511.dtsi"
+#include "zynq-zc706.dtsi"
+#include "zynq-zc706-adv7511.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/jesd204/adxcvr.h>
 
 &i2c_mux {
 	i2c@5 { /* HPC IIC */
@@ -12,11 +25,6 @@
 		eeprom@50 {
 			compatible = "at24,24c02";
 			reg = <0x50>;
-		};
-
-		eeprom@54 {
-			compatible = "at24,24c02";
-			reg = <0x54>;
 		};
 
 		ad7291@2f {
@@ -31,7 +39,7 @@
 		compatible = "adi,axi-dmac-1.00.a";
 		reg = <0x7c400000 0x10000>;
 		#dma-cells = <1>;
-		interrupts = <0 57 0>;
+		interrupts = <0 57 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkc 16>;
 
 		adi,channels {
@@ -52,7 +60,7 @@
 		compatible = "adi,axi-dmac-1.00.a";
 		reg = <0x7c440000  0x10000>;
 		#dma-cells = <1>;
-		interrupts = <0 55 0>;
+		interrupts = <0 55 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkc 16>;
 
 		adi,channels {
@@ -73,7 +81,7 @@
 		compatible = "adi,axi-dmac-1.00.a";
 		reg = <0x7c420000 0x10000>;
 		#dma-cells = <1>;
-		interrupts = <0 56 0>;
+		interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkc 16>;
 
 		adi,channels {
@@ -96,6 +104,8 @@
 		dmas = <&rx_dma 0>;
 		dma-names = "rx";
 		spibus-connected = <&trx0_ad9371>;
+		adi,axi-decimation-core-available;
+		decimation-gpios = <&gpio0 115 GPIO_ACTIVE_HIGH>;
 	};
 
 	axi_ad9371_core_rx_obs: axi-ad9371-rx-obs-hpc@44a08000 {
@@ -116,13 +126,15 @@
 		clock-names = "sampl_clk";
 		spibus-connected = <&trx0_ad9371>;
 		adi,axi-pl-fifo-enable;
+		adi,axi-interpolation-core-available;
+		interpolation-gpios = <&gpio0 116 GPIO_ACTIVE_HIGH>;
 	};
 
 	axi_ad9371_rx_jesd: axi-jesd204-rx@44aa0000 {
 		compatible = "adi,axi-jesd204-rx-1.0";
 		reg = <0x44aa0000 0x1000>;
 
-		interrupts = <0 54 0>;
+		interrupts = <0 54 IRQ_TYPE_LEVEL_HIGH>;
 
 		clocks = <&clkc 16>, <&axi_rx_clkgen>, <&axi_ad9371_adxcvr_rx 0>;
 		clock-names = "s_axi_aclk", "device_clk", "lane_clk";
@@ -138,7 +150,7 @@
 		compatible = "adi,axi-jesd204-tx-1.0";
 		reg = <0x44a90000 0x1000>;
 
-		interrupts = <0 53 0>;
+		interrupts = <0 53 IRQ_TYPE_LEVEL_HIGH>;
 
 		clocks = <&clkc 16>, <&axi_tx_clkgen>, <&axi_ad9371_adxcvr_tx 0>;
 		clock-names = "s_axi_aclk", "device_clk", "lane_clk";
@@ -158,7 +170,7 @@
 		compatible = "adi,axi-jesd204-rx-1.0";
 		reg = <0x44ab0000 0x1000>;
 
-		interrupts = <0 52 0>;
+		interrupts = <0 52 IRQ_TYPE_LEVEL_HIGH>;
 
 		clocks = <&clkc 16>, <&axi_rx_os_clkgen>, <&axi_ad9371_adxcvr_rx_os 0>;
 		clock-names = "s_axi_aclk", "device_clk", "lane_clk";
@@ -174,7 +186,8 @@
 		compatible = "adi,axi-clkgen-2.00.a";
 		reg = <0x43c00000 0x10000>;
 		#clock-cells = <0>;
-		clocks = <&clk0_ad9528 1>;
+		clocks = <&clkc 15>, <&clk0_ad9528 1>;
+		clock-names = "s_axi_aclk", "clkin1";
 		clock-output-names = "axi_tx_clkgen";
 	};
 
@@ -182,7 +195,8 @@
 		compatible = "adi,axi-clkgen-2.00.a";
 		reg = <0x43c10000 0x10000>;
 		#clock-cells = <0>;
-		clocks = <&clk0_ad9528 1>;
+		clocks = <&clkc 15>, <&clk0_ad9528 1>;
+		clock-names = "s_axi_aclk", "clkin1";
 		clock-output-names = "axi_rx_clkgen";
 
 	};
@@ -191,7 +205,8 @@
 		compatible = "adi,axi-clkgen-2.00.a";
 		reg = <0x43c20000 0x10000>;
 		#clock-cells = <0>;
-		clocks = <&clk0_ad9528 1>;
+		clocks = <&clkc 15>, <&clk0_ad9528 1>;
+		clock-names = "s_axi_aclk", "clkin1";
 		clock-output-names = "axi_rx_os_clkgen";
 
 	};
@@ -208,10 +223,9 @@
 		#clock-cells = <1>;
 		clock-output-names = "rx_gt_clk", "rx_out_clk";
 
-		adi,sys-clk-select = <0>;
-		adi,out-clk-select = <3>;
+		adi,sys-clk-select = <XCVR_CPLL>;
+		adi,out-clk-select = <XCVR_REFCLK>;
 		adi,use-lpm-enable;
-		adi,use-cpll-enable;
 	};
 
 	axi_ad9371_adxcvr_rx_os: axi-adxcvr-rx-os@44a50000 {
@@ -226,10 +240,9 @@
 		#clock-cells = <1>;
 		clock-output-names = "rx_os_gt_clk", "rx_os_out_clk";
 
-		adi,sys-clk-select = <0>;
-		adi,out-clk-select = <3>;
+		adi,sys-clk-select = <XCVR_CPLL>;
+		adi,out-clk-select = <XCVR_REFCLK>;
 		adi,use-lpm-enable;
-		adi,use-cpll-enable;
 	};
 
 	axi_ad9371_adxcvr_tx: axi-adxcvr-tx@44a80000 {
@@ -244,8 +257,8 @@
 		#clock-cells = <1>;
 		clock-output-names = "tx_gt_clk", "tx_out_clk";
 
-		adi,sys-clk-select = <3>;
-		adi,out-clk-select = <3>;
+		adi,sys-clk-select = <XCVR_QPLL>;
+		adi,out-clk-select = <XCVR_REFCLK>;
 	};
 };
 

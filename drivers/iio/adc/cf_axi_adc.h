@@ -11,18 +11,8 @@
 #ifndef ADI_AXI_ADC_H_
 #define ADI_AXI_ADC_H_
 
-#define ADI_REG_VERSION		0x0000				/*Version and Scratch Registers */
-#define ADI_VERSION(x)		(((x) & 0xffffffff) << 0)	/* RO, Version number. */
-#define VERSION_IS(x,y,z)	((x) << 16 | (y) << 8 | (z))
-#define ADI_REG_ID		0x0004			 	/*Version and Scratch Registers */
-#define ADI_ID(x)		(((x) & 0xffffffff) << 0)   	/* RO, Instance identifier number. */
-#define ADI_REG_SCRATCH		0x0008			 	/*Version and Scratch Registers */
-#define ADI_SCRATCH(x)		(((x) & 0xffffffff) << 0)	/* RW, Scratch register. */
-
-#define PCORE_VERSION(major, minor, letter) ((major << 16) | (minor << 8) | letter)
-#define PCORE_VERSION_MAJOR(version) (version >> 16)
-#define PCORE_VERSION_MINOR(version) ((version >> 8) & 0xff)
-#define PCORE_VERSION_LETTER(version) (version & 0xff)
+#include <linux/fpga/adi-axi-common.h>
+#include <linux/iio/iio.h>
 
 /* ADC COMMON */
 
@@ -32,18 +22,26 @@
 #define ADI_DATAFORMAT_DISABLE		(1 << 2)
 #define ADI_USERPORTS_DISABLE		(1 << 3)
 #define ADI_MODE_1R1T			(1 << 4)
-#define ADI_SCALECORRECTION_ONLY	(1 << 5)
+#define ADI_DELAY_CONTROL_DISABLE 	(1 << 5)
 #define ADI_CMOS_OR_LVDS_N		(1 << 7)
 #define ADI_PPS_RECEIVER_ENABLE		(1 << 8)
+#define ADI_SCALECORRECTION_ONLY	(1 << 9)
+#define ADI_EXT_SYNC			(1 << 12)
 
 #define ADI_REG_RSTN			0x0040
 #define ADI_RSTN				(1 << 0)
 #define ADI_MMCM_RSTN 			(1 << 1)
 
 #define ADI_REG_CNTRL			0x0044
+#define ADI_SYNC			(1 << 3)
 #define ADI_R1_MODE			(1 << 2)
 #define ADI_DDR_EDGESEL			(1 << 1)
 #define ADI_PIN_MODE			(1 << 0)
+
+#define ADI_REG_CNTRL_2			0x0048
+#define ADI_EXT_SYNC_ARM		(1 << 1)
+#define ADI_EXT_SYNC_DISARM		(1 << 2)
+#define ADI_MANUAL_SYNC_REQUEST		(1 << 8)
 
 #define ADI_REG_CLK_FREQ			0x0054
 #define ADI_CLK_FREQ(x)			(((x) & 0xFFFFFFFF) << 0)
@@ -72,6 +70,9 @@
 #define ADI_DELAY_STATUS			(1 << 8)
 #define ADI_DELAY_RDATA(x)		(((x) & 0x1F) << 0)
 #define ADI_TO_DELAY_RDATA(x)		(((x) >> 0) & 0x1F)
+
+#define ADI_REG_SYNC_STATUS		0x0068
+#define ADI_ADC_SYNC_STATUS		(1 << 0)
 
 #define ADI_REG_DRP_CNTRL		0x0070
 #define ADI_DRP_SEL			(1 << 29)
@@ -148,7 +149,9 @@ enum adc_pn_sel {
 	ADC_PN23 = 6,
 	ADC_PN31 = 7,
 	ADC_PN_CUSTOM = 9,
-	ADC_PN_OFF = 10,
+	ADC_PN_RAMP_NIBBLE = 10,
+	ADC_PN_RAMP_16 = 11,
+	ADC_PN_OFF = 12,
 };
 
 enum adc_data_sel {
@@ -173,20 +176,21 @@ enum adc_data_sel {
 #define ADI_USR_DECIMATION_N(x)			(((x) & 0xFFFF) << 0)
 #define ADI_TO_USR_DECIMATION_N(x)		(((x) >> 0) & 0xFFFF)
 
-#define ADI_REG_ADC_DP_DISABLE 			0x00C0
-
 /* PCORE Version > 8.00 */
 #define ADI_REG_DELAY(l)				(0x0800 + (l) * 0x4)
 
 /* debugfs direct register access */
 #define DEBUGFS_DRA_PCORE_REG_MAGIC	0x80000000
 
-#define AXIADC_MAX_CHANNEL		16
+#define AXIADC_MAX_CHANNEL		128
 
 #include <linux/spi/spi.h>
 #include <linux/clk/clkscale.h>
 
+struct axiadc_state;
+
 struct axiadc_chip_info {
+	unsigned int			id;
 	char				*name;
 	unsigned			num_channels;
 	unsigned 		num_shadow_slave_channels;
@@ -198,34 +202,13 @@ struct axiadc_chip_info {
 	struct iio_chan_spec		channel[AXIADC_MAX_CHANNEL];
 };
 
-struct axiadc_state {
-	struct device 			*dev_spi;
-	struct iio_info			iio_info;
-	struct clk 			*clk;
-	size_t				regs_size;
-	void __iomem			*regs;
-	void __iomem			*slave_regs;
-	unsigned				max_usr_channel;
-	unsigned			adc_def_output_mode;
-	unsigned			max_count;
-	unsigned			id;
-	unsigned			pcore_version;
-	unsigned			decimation_factor;
-	bool				dp_disable;
-	unsigned long long		adc_clk;
-	unsigned			have_slave_channels;
-
-	struct iio_hw_consumer		*frontend;
-
-	struct iio_chan_spec		channels[AXIADC_MAX_CHANNEL];
-};
-
 struct axiadc_converter {
 	struct spi_device 	*spi;
 	struct clk 		*clk;
 	struct clock_scale		adc_clkscale;
 	struct clk		*lane_clk;
 	struct clk		*sysref_clk;
+	struct clk		*out_clk;
 	void 			*phy;
 	struct gpio_desc		*pwrdown_gpio;
 	struct gpio_desc		*reset_gpio;
@@ -236,11 +219,12 @@ struct axiadc_converter {
 	unsigned long 		adc_clk;
 	const struct axiadc_chip_info	*chip_info;
 
+	struct delayed_work	watchdog_work;
 	bool			sample_rate_read_only;
+	bool			running;
 
 	int (*reg_access)(struct iio_dev *indio_dev, unsigned int reg,
 		unsigned int writeval, unsigned int *readval);
-	int (*setup)(struct spi_device *spi, unsigned mode);
 
 	struct iio_chan_spec const	*channels;
 	int				num_channels;
@@ -285,73 +269,34 @@ struct axiadc_converter {
 			enum iio_event_direction dir,
 			int state);
 
+	int (*read_label)(struct iio_dev *indio_dev,
+			const struct iio_chan_spec *chan, char *label);
+
 	int (*post_setup)(struct iio_dev *indio_dev);
+	int (*post_iio_register)(struct iio_dev *indio_dev);
 	int (*set_pnsel)(struct iio_dev *indio_dev, unsigned chan,
 			enum adc_pn_sel sel);
 };
 
 
 
-static inline struct axiadc_converter *to_converter(struct device *dev)
-{
-	struct axiadc_converter *conv = spi_get_drvdata(to_spi_device(dev));
-
-	if (conv)
-		return conv;
-
-	return ERR_PTR(-ENODEV);
-};
-
-struct axiadc_spidev {
-	struct device_node *of_nspi;
-	struct device *dev_spi;
-};
+struct axiadc_converter *to_converter(struct device *dev);
 
 /*
  * IO accessors
  */
 
-static inline void axiadc_write(struct axiadc_state *st, unsigned reg, unsigned val)
-{
-	iowrite32(val, st->regs + reg);
-}
+void axiadc_write(struct axiadc_state *st, unsigned int reg, unsigned int val);
+unsigned int axiadc_read(struct axiadc_state *st, unsigned int reg);
+void axiadc_slave_write(struct axiadc_state *st, unsigned int reg,
+			unsigned int val);
+unsigned int axiadc_slave_read(struct axiadc_state *st, unsigned int reg);
 
-static inline unsigned int axiadc_read(struct axiadc_state *st, unsigned reg)
-{
-	return ioread32(st->regs + reg);
-}
-
-static inline void axiadc_slave_write(struct axiadc_state *st, unsigned reg, unsigned val)
-{
-	iowrite32(val, st->slave_regs + reg);
-}
-
-static inline unsigned int axiadc_slave_read(struct axiadc_state *st, unsigned reg)
-{
-	return ioread32(st->slave_regs + reg);
-}
-
-
-static inline void axiadc_idelay_set(struct axiadc_state *st,
-				unsigned lane, unsigned val)
-{
-	if (PCORE_VERSION_MAJOR(st->pcore_version) > 8) {
-		axiadc_write(st, ADI_REG_DELAY(lane), val);
-	} else {
-		axiadc_write(st, ADI_REG_DELAY_CNTRL, 0);
-		axiadc_write(st, ADI_REG_DELAY_CNTRL,
-				ADI_DELAY_ADDRESS(lane)
-				| ADI_DELAY_WDATA(val)
-				| ADI_DELAY_SEL);
-	}
-}
+void axiadc_idelay_set(struct axiadc_state *st, unsigned int lane,
+		       unsigned int val);
 
 int axiadc_set_pnsel(struct axiadc_state *st, int channel, enum adc_pn_sel sel);
 enum adc_pn_sel axiadc_get_pnsel(struct axiadc_state *st,
 			       int channel, const char **name);
-
-int axiadc_configure_ring_stream(struct iio_dev *indio_dev,
-	const char *dma_name);
-void axiadc_unconfigure_ring_stream(struct iio_dev *indio_dev);
 
 #endif /* ADI_AXI_ADC_H_ */

@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * uartlite.c: Serial driver for Xilinx uartlite serial controller
  *
  * Copyright (C) 2006 Peter Korsgaard <jacmet@sunsite.dk>
  * Copyright (C) 2007 Secret Lab Technologies Ltd.
- *
- * This file is licensed under the terms of the GNU General Public License
- * version 2.  This program is licensed "as is" without any warranty of any
- * kind, whether express or implied.
  */
 
 #include <linux/platform_device.h>
@@ -25,6 +22,7 @@
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/clk.h>
+#include <linux/pm_runtime.h>
 
 #define ULITE_NAME		"ttyUL"
 #define ULITE_MAJOR		204
@@ -35,7 +33,7 @@
  * Register definitions
  *
  * For register details see datasheet:
- * http://www.xilinx.com/support/documentation/ip_documentation/opb_uartlite.pdf
+ * https://www.xilinx.com/support/documentation/ip_documentation/opb_uartlite.pdf
  */
 
 #define ULITE_RX		0x00
@@ -57,9 +55,12 @@
 #define ULITE_CONTROL_RST_TX	0x01
 #define ULITE_CONTROL_RST_RX	0x02
 #define ULITE_CONTROL_IE	0x10
+#define UART_AUTOSUSPEND_TIMEOUT	3000
 
 /* Static pointer to console port */
+#ifdef CONFIG_SERIAL_UARTLITE_CONSOLE
 static struct uart_port *console_port;
+#endif
 
 struct uartlite_data {
 	const struct uartlite_reg_ops *reg_ops;
@@ -295,7 +296,6 @@ static void ulite_shutdown(struct uart_port *port)
 	struct uartlite_data *pdata = port->private_data;
 
 	uart_out32(0, ULITE_CONTROL, port);
-	uart_in32(ULITE_CONTROL, port); /* dummy */
 	free_irq(port->irq, port);
 	clk_disable(pdata->clk);
 }
@@ -366,7 +366,6 @@ static int ulite_request_port(struct uart_port *port)
 	}
 
 	pdata->reg_ops = &uartlite_be;
-	ret = uart_in32(ULITE_CONTROL, port);
 	uart_out32(ULITE_CONTROL_RST_TX, ULITE_CONTROL, port);
 	ret = uart_in32(ULITE_STATUS, port);
 	/* Endianess detection */
@@ -389,14 +388,18 @@ static int ulite_verify_port(struct uart_port *port, struct serial_struct *ser)
 }
 
 static void ulite_pm(struct uart_port *port, unsigned int state,
-	      unsigned int oldstate)
+		     unsigned int oldstate)
 {
-	struct uartlite_data *pdata = port->private_data;
+	int ret;
 
-	if (!state)
-		clk_enable(pdata->clk);
-	else
-		clk_disable(pdata->clk);
+	if (!state) {
+		ret = pm_runtime_get_sync(port->dev);
+		if (ret < 0)
+			dev_err(port->dev, "Failed to enable clocks\n");
+	} else {
+		pm_runtime_mark_last_busy(port->dev);
+		pm_runtime_put_autosuspend(port->dev);
+	}
 }
 
 #ifdef CONFIG_CONSOLE_POLL
@@ -615,7 +618,7 @@ static struct uart_driver ulite_uart_driver = {
  * Returns: 0 on success, <0 otherwise
  */
 static int ulite_assign(struct device *dev, int id, u32 base, int irq,
-		struct uartlite_data *pdata)
+			struct uartlite_data *pdata)
 {
 	struct uart_port *port;
 	int rc;
@@ -735,11 +738,37 @@ static int __maybe_unused ulite_resume(struct device *dev)
 	return 0;
 }
 
+static int __maybe_unused ulite_runtime_suspend(struct device *dev)
+{
+	struct uart_port *port = dev_get_drvdata(dev);
+	struct uartlite_data *pdata = port->private_data;
+
+	clk_disable(pdata->clk);
+	return 0;
+};
+
+static int __maybe_unused ulite_runtime_resume(struct device *dev)
+{
+	struct uart_port *port = dev_get_drvdata(dev);
+	struct uartlite_data *pdata = port->private_data;
+	int ret;
+
+	ret = clk_enable(pdata->clk);
+	if (ret) {
+		dev_err(dev, "Cannot enable clock.\n");
+		return ret;
+	}
+	return 0;
+}
 /* ---------------------------------------------------------------------
  * Platform bus binding
  */
 
-static SIMPLE_DEV_PM_OPS(ulite_pm_ops, ulite_suspend, ulite_resume);
+static const struct dev_pm_ops ulite_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(ulite_suspend, ulite_resume)
+	SET_RUNTIME_PM_OPS(ulite_runtime_suspend,
+			   ulite_runtime_resume, NULL)
+};
 
 #if defined(CONFIG_OF)
 /* Match table for of_platform binding */
@@ -764,17 +793,8 @@ static int ulite_probe(struct platform_device *pdev)
 	if (prop)
 		id = be32_to_cpup(prop);
 #endif
-	if (!ulite_uart_driver.state) {
-		dev_dbg(&pdev->dev, "uartlite: calling uart_register_driver()\n");
-		ret = uart_register_driver(&ulite_uart_driver);
-		if (ret < 0) {
-			dev_err(&pdev->dev, "Failed to register driver\n");
-			return ret;
-		}
-	}
-
 	pdata = devm_kzalloc(&pdev->dev, sizeof(struct uartlite_data),
-			GFP_KERNEL);
+			     GFP_KERNEL);
 	if (!pdata)
 		return -ENOMEM;
 
@@ -804,10 +824,29 @@ static int ulite_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	if (!ulite_uart_driver.state) {
+		dev_dbg(&pdev->dev, "uartlite: calling uart_register_driver()\n");
+		ret = uart_register_driver(&ulite_uart_driver);
+		if (ret < 0) {
+			dev_err(&pdev->dev, "Failed to register driver\n");
+			goto err_out_clk_disable;
+		}
+	}
+
+	pm_runtime_use_autosuspend(&pdev->dev);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, UART_AUTOSUSPEND_TIMEOUT);
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
+
 	ret = ulite_assign(&pdev->dev, id, res->start, irq, pdata);
 
-	clk_disable(pdata->clk);
+	pm_runtime_mark_last_busy(&pdev->dev);
+	pm_runtime_put_autosuspend(&pdev->dev);
 
+	return ret;
+
+err_out_clk_disable:
+	clk_disable_unprepare(pdata->clk);
 	return ret;
 }
 
@@ -815,9 +854,14 @@ static int ulite_remove(struct platform_device *pdev)
 {
 	struct uart_port *port = dev_get_drvdata(&pdev->dev);
 	struct uartlite_data *pdata = port->private_data;
+	int rc;
 
 	clk_disable_unprepare(pdata->clk);
-	return ulite_release(&pdev->dev);
+	rc = ulite_release(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	return rc;
 }
 
 /* work with hotplug and coldplug */
@@ -839,6 +883,7 @@ static struct platform_driver ulite_platform_driver = {
 
 static int __init ulite_init(void)
 {
+
 	pr_debug("uartlite: calling platform_driver_register()\n");
 	return platform_driver_register(&ulite_platform_driver);
 }
@@ -846,7 +891,8 @@ static int __init ulite_init(void)
 static void __exit ulite_exit(void)
 {
 	platform_driver_unregister(&ulite_platform_driver);
-	uart_unregister_driver(&ulite_uart_driver);
+	if (ulite_uart_driver.state)
+		uart_unregister_driver(&ulite_uart_driver);
 }
 
 module_init(ulite_init);

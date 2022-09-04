@@ -1,18 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Analog Devices AD9739A
+ * https://wiki.analog.com/resources/tools-software/linux-drivers/iio-dds/axi-dac-dds-hdl
+ * https://wiki.analog.com/resources/fpga/xilinx/fmc/ad9739a
+ *
+ * hdl_project: <ad9739a_fmc/zc706>
+ * board_revision: <>
+ *
+ * Copyright (C) 2016-2019 Analog Devices Inc.
+ */
 /dts-v1/;
 
-/include/ "zynq-zc706.dtsi"
-/include/ "zynq-zc706-adv7511.dtsi"
+#include "zynq-zc706.dtsi"
+#include "zynq-zc706-adv7511.dtsi"
 
 &i2c_mux {
 	fmc_i2c: i2c@6 {
 		#size-cells = <0>;
 		#address-cells = <1>;
 		reg = <6>;
-
-		eeprom@50 {
-			compatible = "at24,24c02";
-			reg = <0x50>;
-		};
 	};
 };
 
@@ -41,7 +47,7 @@
 		compatible = "adi,axi-dmac-1.00.a";
 		reg = <0x7c420000 0x10000>;
 		#dma-cells = <1>;
-		interrupts = <0 56 0>;
+		interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkc 16>;
 
 		adi,channels {

@@ -5,7 +5,9 @@
  *
  * Licensed under the GPL-2.
  */
-/include/ "zynq.dtsi"
+#include "zynq.dtsi"
+
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	model = "Analog Devices ADRV9361-Z7035 (Z7035/AD9361)";
@@ -15,7 +17,7 @@
 	};
 
 	chosen {
-		linux,stdout-path = "/amba@0/uart@E0001000";
+		stdout-path = "/amba@0/uart@E0001000";
 	};
 
 	clocks {
@@ -40,7 +42,6 @@
 		compatible = "gpio-gate-clock";
 		clocks = <&xo_40mhz_fixed_clk>;
 		enable-gpios = <&gpio0 105 0>; /* Set to 1 for extern AD9361_CLK (J1 on PZSDRCC-FMC) */
-		clk-set-rate-parent-enable;
 		clock-output-names = "ad9361_ext_refclk";
 	};
 
@@ -140,7 +141,7 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c400000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 57 0>;
+			interrupts = <0 57 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
 
 			adi,channels {
@@ -161,7 +162,7 @@
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c420000 0x10000>;
 			#dma-cells = <1>;
-			interrupts = <0 56 0>;
+			interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
 
 			adi,channels {
@@ -198,6 +199,11 @@
 		mwipcore@43c00000 {
 			compatible = "mathworks,mwipcore-axi4lite-v1.00";
 			reg = <0x43C00000 0xffff>;
+		};
+
+		axi_sysid_0: axi-sysid-0@45000000 {
+			compatible = "adi,axi-sysid-1.00.a";
+			reg = <0x45000000 0x10000>;
 		};
 	};
 };

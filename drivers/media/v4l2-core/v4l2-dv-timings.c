@@ -1,21 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * v4l2-dv-timings - dv-timings helper functions
  *
  * Copyright 2013 Cisco Systems, Inc. and/or its affiliates. All rights reserved.
- *
- * This program is free software; you may redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; version 2 of the License.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
  */
 
 #include <linux/module.h>
@@ -247,11 +234,11 @@ EXPORT_SYMBOL_GPL(v4l2_find_dv_timings_cea861_vic);
 
 /**
  * v4l2_match_dv_timings - check if two timings match
- * @t1 - compare this v4l2_dv_timings struct...
- * @t2 - with this struct.
- * @pclock_delta - the allowed pixelclock deviation.
- * @match_reduced_fps - if true, then fail if V4L2_DV_FL_REDUCED_FPS does not
- * match.
+ * @t1: compare this v4l2_dv_timings struct...
+ * @t2: with this struct.
+ * @pclock_delta: the allowed pixelclock deviation.
+ * @match_reduced_fps: if true, then fail if V4L2_DV_FL_REDUCED_FPS does not
+ *	match.
  *
  * Compare t1 with t2 with a given margin of error for the pixelclock.
  */
@@ -306,7 +293,7 @@ void v4l2_print_dv_timings(const char *dev_prefix, const char *prefix,
 	if (prefix == NULL)
 		prefix = "";
 
-	pr_info("%s: %s%ux%u%s%u.%u (%ux%u)\n", dev_prefix, prefix,
+	pr_info("%s: %s%ux%u%s%u.%02u (%ux%u)\n", dev_prefix, prefix,
 		bt->width, bt->height, bt->interlaced ? "i" : "p",
 		fps / 100, fps % 100, htot, vtot);
 
@@ -386,6 +373,45 @@ struct v4l2_fract v4l2_dv_timings_aspect_ratio(const struct v4l2_dv_timings *t)
 	return ratio;
 }
 EXPORT_SYMBOL_GPL(v4l2_dv_timings_aspect_ratio);
+
+/** v4l2_calc_timeperframe - helper function to calculate timeperframe based
+ *	v4l2_dv_timings fields.
+ * @t - Timings for the video mode.
+ *
+ * Calculates the expected timeperframe using the pixel clock value and
+ * horizontal/vertical measures. This means that v4l2_dv_timings structure
+ * must be correctly and fully filled.
+ */
+struct v4l2_fract v4l2_calc_timeperframe(const struct v4l2_dv_timings *t)
+{
+	const struct v4l2_bt_timings *bt = &t->bt;
+	struct v4l2_fract fps_fract = { 1, 1 };
+	unsigned long n, d;
+	u32 htot, vtot, fps;
+	u64 pclk;
+
+	if (t->type != V4L2_DV_BT_656_1120)
+		return fps_fract;
+
+	htot = V4L2_DV_BT_FRAME_WIDTH(bt);
+	vtot = V4L2_DV_BT_FRAME_HEIGHT(bt);
+	pclk = bt->pixelclock;
+
+	if ((bt->flags & V4L2_DV_FL_CAN_DETECT_REDUCED_FPS) &&
+	    (bt->flags & V4L2_DV_FL_REDUCED_FPS))
+		pclk = div_u64(pclk * 1000ULL, 1001);
+
+	fps = (htot * vtot) > 0 ? div_u64((100 * pclk), (htot * vtot)) : 0;
+	if (!fps)
+		return fps_fract;
+
+	rational_best_approximation(fps, 100, fps, 100, &n, &d);
+
+	fps_fract.numerator = d;
+	fps_fract.denominator = n;
+	return fps_fract;
+}
+EXPORT_SYMBOL_GPL(v4l2_calc_timeperframe);
 
 /*
  * CVT defines
@@ -731,7 +757,7 @@ bool v4l2_detect_gtf(unsigned frame_height,
 	pix_clk = pix_clk / GTF_PXL_CLK_GRAN * GTF_PXL_CLK_GRAN;
 
 	hsync = (frame_width * 8 + 50) / 100;
-	hsync = ((hsync + GTF_CELL_GRAN / 2) / GTF_CELL_GRAN) * GTF_CELL_GRAN;
+	hsync = DIV_ROUND_CLOSEST(hsync, GTF_CELL_GRAN) * GTF_CELL_GRAN;
 
 	h_fp = h_blank / 2 - hsync;
 
@@ -816,6 +842,146 @@ struct v4l2_fract v4l2_calc_aspect_ratio(u8 hor_landscape, u8 vert_portrait)
 	return aspect;
 }
 EXPORT_SYMBOL_GPL(v4l2_calc_aspect_ratio);
+
+/** v4l2_hdmi_rx_colorimetry - determine HDMI colorimetry information
+ *	based on various InfoFrames.
+ * @avi: the AVI InfoFrame
+ * @hdmi: the HDMI Vendor InfoFrame, may be NULL
+ * @height: the frame height
+ *
+ * Determines the HDMI colorimetry information, i.e. how the HDMI
+ * pixel color data should be interpreted.
+ *
+ * Note that some of the newer features (DCI-P3, HDR) are not yet
+ * implemented: the hdmi.h header needs to be updated to the HDMI 2.0
+ * and CTA-861-G standards.
+ */
+struct v4l2_hdmi_colorimetry
+v4l2_hdmi_rx_colorimetry(const struct hdmi_avi_infoframe *avi,
+			 const struct hdmi_vendor_infoframe *hdmi,
+			 unsigned int height)
+{
+	struct v4l2_hdmi_colorimetry c = {
+		V4L2_COLORSPACE_SRGB,
+		V4L2_YCBCR_ENC_DEFAULT,
+		V4L2_QUANTIZATION_FULL_RANGE,
+		V4L2_XFER_FUNC_SRGB
+	};
+	bool is_ce = avi->video_code || (hdmi && hdmi->vic);
+	bool is_sdtv = height <= 576;
+	bool default_is_lim_range_rgb = avi->video_code > 1;
+
+	switch (avi->colorspace) {
+	case HDMI_COLORSPACE_RGB:
+		/* RGB pixel encoding */
+		switch (avi->colorimetry) {
+		case HDMI_COLORIMETRY_EXTENDED:
+			switch (avi->extended_colorimetry) {
+			case HDMI_EXTENDED_COLORIMETRY_OPRGB:
+				c.colorspace = V4L2_COLORSPACE_OPRGB;
+				c.xfer_func = V4L2_XFER_FUNC_OPRGB;
+				break;
+			case HDMI_EXTENDED_COLORIMETRY_BT2020:
+				c.colorspace = V4L2_COLORSPACE_BT2020;
+				c.xfer_func = V4L2_XFER_FUNC_709;
+				break;
+			default:
+				break;
+			}
+			break;
+		default:
+			break;
+		}
+		switch (avi->quantization_range) {
+		case HDMI_QUANTIZATION_RANGE_LIMITED:
+			c.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+			break;
+		case HDMI_QUANTIZATION_RANGE_FULL:
+			break;
+		default:
+			if (default_is_lim_range_rgb)
+				c.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+			break;
+		}
+		break;
+
+	default:
+		/* YCbCr pixel encoding */
+		c.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+		switch (avi->colorimetry) {
+		case HDMI_COLORIMETRY_NONE:
+			if (!is_ce)
+				break;
+			if (is_sdtv) {
+				c.colorspace = V4L2_COLORSPACE_SMPTE170M;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_601;
+			} else {
+				c.colorspace = V4L2_COLORSPACE_REC709;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_709;
+			}
+			c.xfer_func = V4L2_XFER_FUNC_709;
+			break;
+		case HDMI_COLORIMETRY_ITU_601:
+			c.colorspace = V4L2_COLORSPACE_SMPTE170M;
+			c.ycbcr_enc = V4L2_YCBCR_ENC_601;
+			c.xfer_func = V4L2_XFER_FUNC_709;
+			break;
+		case HDMI_COLORIMETRY_ITU_709:
+			c.colorspace = V4L2_COLORSPACE_REC709;
+			c.ycbcr_enc = V4L2_YCBCR_ENC_709;
+			c.xfer_func = V4L2_XFER_FUNC_709;
+			break;
+		case HDMI_COLORIMETRY_EXTENDED:
+			switch (avi->extended_colorimetry) {
+			case HDMI_EXTENDED_COLORIMETRY_XV_YCC_601:
+				c.colorspace = V4L2_COLORSPACE_REC709;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_XV709;
+				c.xfer_func = V4L2_XFER_FUNC_709;
+				break;
+			case HDMI_EXTENDED_COLORIMETRY_XV_YCC_709:
+				c.colorspace = V4L2_COLORSPACE_REC709;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_XV601;
+				c.xfer_func = V4L2_XFER_FUNC_709;
+				break;
+			case HDMI_EXTENDED_COLORIMETRY_S_YCC_601:
+				c.colorspace = V4L2_COLORSPACE_SRGB;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_601;
+				c.xfer_func = V4L2_XFER_FUNC_SRGB;
+				break;
+			case HDMI_EXTENDED_COLORIMETRY_OPYCC_601:
+				c.colorspace = V4L2_COLORSPACE_OPRGB;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_601;
+				c.xfer_func = V4L2_XFER_FUNC_OPRGB;
+				break;
+			case HDMI_EXTENDED_COLORIMETRY_BT2020:
+				c.colorspace = V4L2_COLORSPACE_BT2020;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_BT2020;
+				c.xfer_func = V4L2_XFER_FUNC_709;
+				break;
+			case HDMI_EXTENDED_COLORIMETRY_BT2020_CONST_LUM:
+				c.colorspace = V4L2_COLORSPACE_BT2020;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_BT2020_CONST_LUM;
+				c.xfer_func = V4L2_XFER_FUNC_709;
+				break;
+			default: /* fall back to ITU_709 */
+				c.colorspace = V4L2_COLORSPACE_REC709;
+				c.ycbcr_enc = V4L2_YCBCR_ENC_709;
+				c.xfer_func = V4L2_XFER_FUNC_709;
+				break;
+			}
+			break;
+		default:
+			break;
+		}
+		/*
+		 * YCC Quantization Range signaling is more-or-less broken,
+		 * let's just ignore this.
+		 */
+		break;
+	}
+	return c;
+}
+EXPORT_SYMBOL_GPL(v4l2_hdmi_rx_colorimetry);
 
 /**
  * v4l2_get_edid_phys_addr() - find and return the physical address

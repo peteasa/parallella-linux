@@ -1,13 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * otg_fsm.c - ChipIdea USB IP core OTG FSM driver
  *
  * Copyright (C) 2014 Freescale Semiconductor, Inc.
  *
  * Author: Jun Li
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 /*
@@ -32,7 +29,7 @@
 
 /* Add for otg: interact with user space app */
 static ssize_t
-get_a_bus_req(struct device *dev, struct device_attribute *attr, char *buf)
+a_bus_req_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	char		*next;
 	unsigned	size, t;
@@ -48,7 +45,7 @@ get_a_bus_req(struct device *dev, struct device_attribute *attr, char *buf)
 }
 
 static ssize_t
-set_a_bus_req(struct device *dev, struct device_attribute *attr,
+a_bus_req_store(struct device *dev, struct device_attribute *attr,
 					const char *buf, size_t count)
 {
 	struct ci_hdrc *ci = dev_get_drvdata(dev);
@@ -78,10 +75,10 @@ set_a_bus_req(struct device *dev, struct device_attribute *attr,
 
 	return count;
 }
-static DEVICE_ATTR(a_bus_req, S_IRUGO | S_IWUSR, get_a_bus_req, set_a_bus_req);
+static DEVICE_ATTR_RW(a_bus_req);
 
 static ssize_t
-get_a_bus_drop(struct device *dev, struct device_attribute *attr, char *buf)
+a_bus_drop_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	char		*next;
 	unsigned	size, t;
@@ -97,7 +94,7 @@ get_a_bus_drop(struct device *dev, struct device_attribute *attr, char *buf)
 }
 
 static ssize_t
-set_a_bus_drop(struct device *dev, struct device_attribute *attr,
+a_bus_drop_store(struct device *dev, struct device_attribute *attr,
 					const char *buf, size_t count)
 {
 	struct ci_hdrc	*ci = dev_get_drvdata(dev);
@@ -118,11 +115,10 @@ set_a_bus_drop(struct device *dev, struct device_attribute *attr,
 
 	return count;
 }
-static DEVICE_ATTR(a_bus_drop, S_IRUGO | S_IWUSR, get_a_bus_drop,
-						set_a_bus_drop);
+static DEVICE_ATTR_RW(a_bus_drop);
 
 static ssize_t
-get_b_bus_req(struct device *dev, struct device_attribute *attr, char *buf)
+b_bus_req_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	char		*next;
 	unsigned	size, t;
@@ -138,7 +134,7 @@ get_b_bus_req(struct device *dev, struct device_attribute *attr, char *buf)
 }
 
 static ssize_t
-set_b_bus_req(struct device *dev, struct device_attribute *attr,
+b_bus_req_store(struct device *dev, struct device_attribute *attr,
 					const char *buf, size_t count)
 {
 	struct ci_hdrc	*ci = dev_get_drvdata(dev);
@@ -163,10 +159,10 @@ set_b_bus_req(struct device *dev, struct device_attribute *attr,
 
 	return count;
 }
-static DEVICE_ATTR(b_bus_req, S_IRUGO | S_IWUSR, get_b_bus_req, set_b_bus_req);
+static DEVICE_ATTR_RW(b_bus_req);
 
 static ssize_t
-set_a_clr_err(struct device *dev, struct device_attribute *attr,
+a_clr_err_store(struct device *dev, struct device_attribute *attr,
 					const char *buf, size_t count)
 {
 	struct ci_hdrc	*ci = dev_get_drvdata(dev);
@@ -183,7 +179,7 @@ set_a_clr_err(struct device *dev, struct device_attribute *attr,
 
 	return count;
 }
-static DEVICE_ATTR(a_clr_err, S_IWUSR, NULL, set_a_clr_err);
+static DEVICE_ATTR_WO(a_clr_err);
 
 static struct attribute *inputs_attrs[] = {
 	&dev_attr_a_bus_req.attr,
@@ -466,10 +462,6 @@ static void ci_otg_drv_vbus(struct otg_fsm *fsm, int on)
 		/* Enable power power */
 		hw_write(ci, OP_PORTSC, PORTSC_W1C_BITS | PORTSC_PP,
 							PORTSC_PP);
-
-		if (ci->usb_phy && ci->usb_phy->otg)
-			otg_set_vbus(ci->usb_phy->otg, true);
-
 		if (ci->platdata->reg_vbus) {
 			ret = regulator_enable(ci->platdata->reg_vbus);
 			if (ret) {
@@ -479,6 +471,11 @@ static void ci_otg_drv_vbus(struct otg_fsm *fsm, int on)
 				return;
 			}
 		}
+
+		if (ci->platdata->flags & CI_HDRC_PHY_VBUS_CONTROL &&
+		    ci->usb_phy)
+			ci->usb_phy->otg->set_vbus(ci->usb_phy->otg, 1);
+
 		/* Disable data pulse irq */
 		hw_write_otgsc(ci, OTGSC_DPIE, 0);
 
@@ -487,8 +484,10 @@ static void ci_otg_drv_vbus(struct otg_fsm *fsm, int on)
 	} else {
 		if (ci->platdata->reg_vbus)
 			regulator_disable(ci->platdata->reg_vbus);
-		if (ci->usb_phy && ci->usb_phy->otg)
-			otg_set_vbus(ci->usb_phy->otg, false);
+
+		if (ci->platdata->flags & CI_HDRC_PHY_VBUS_CONTROL &&
+		    ci->usb_phy)
+			ci->usb_phy->otg->set_vbus(ci->usb_phy->otg, 0);
 
 		fsm->a_bus_drop = 1;
 		fsm->a_bus_req = 0;

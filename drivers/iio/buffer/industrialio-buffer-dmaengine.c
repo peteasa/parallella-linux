@@ -1,8 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Copyright 2014-2015 Analog Devices Inc.
  *  Author: Lars-Peter Clausen <lars@metafoo.de>
- *
- * Licensed under the GPL-2 or later.
  */
 
 #include <linux/slab.h>
@@ -46,7 +45,8 @@ static struct dmaengine_buffer *iio_buffer_to_dmaengine_buffer(
 	return container_of(buffer, struct dmaengine_buffer, queue.buffer);
 }
 
-static void iio_dmaengine_buffer_block_done(void *data)
+static void iio_dmaengine_buffer_block_done(void *data,
+		const struct dmaengine_result *result)
 {
 	struct iio_dma_buffer_block *block = data;
 	unsigned long flags;
@@ -54,6 +54,7 @@ static void iio_dmaengine_buffer_block_done(void *data)
 	spin_lock_irqsave(&block->queue->list_lock, flags);
 	list_del(&block->head);
 	spin_unlock_irqrestore(&block->queue->list_lock, flags);
+	block->block.bytes_used -= result->residue;
 	iio_dma_buffer_block_done(block);
 }
 
@@ -90,7 +91,7 @@ int iio_dmaengine_buffer_submit_block(struct iio_dma_buffer_queue *queue,
 		if (!desc)
 			return -ENOMEM;
 
-		desc->callback = iio_dmaengine_buffer_block_done;
+		desc->callback_result = iio_dmaengine_buffer_block_done;
 		desc->callback_param = block;
 	}
 
@@ -200,7 +201,7 @@ struct iio_buffer *iio_dmaengine_buffer_alloc(struct device *dev,
 	if (!dmaengine_buffer)
 		return ERR_PTR(-ENOMEM);
 
-	chan = dma_request_slave_channel_reason(dev, channel);
+	chan = dma_request_chan(dev, channel);
 	if (IS_ERR(chan)) {
 		ret = PTR_ERR(chan);
 		goto err_free;
@@ -264,6 +265,46 @@ void iio_dmaengine_buffer_free(struct iio_buffer *buffer)
 	iio_buffer_put(buffer);
 }
 EXPORT_SYMBOL_GPL(iio_dmaengine_buffer_free);
+
+static void __devm_iio_dmaengine_buffer_free(struct device *dev, void *res)
+{
+	iio_dmaengine_buffer_free(*(struct iio_buffer **)res);
+}
+
+/**
+ * devm_iio_dmaengine_buffer_alloc() - Resource-managed iio_dmaengine_buffer_alloc()
+ * @dev: Parent device for the buffer
+ * @channel: DMA channel name, typically "rx".
+ *
+ * This allocates a new IIO buffer which internally uses the DMAengine framework
+ * to perform its transfers. The parent device will be used to request the DMA
+ * channel.
+ *
+ * The buffer will be automatically de-allocated once the device gets destroyed.
+ */
+struct iio_buffer *devm_iio_dmaengine_buffer_alloc(struct device *dev,
+	const char *channel, const struct iio_dma_buffer_ops *ops,
+	void *driver_data)
+{
+	struct iio_buffer **bufferp, *buffer;
+
+	bufferp = devres_alloc(__devm_iio_dmaengine_buffer_free,
+			       sizeof(*bufferp), GFP_KERNEL);
+	if (!bufferp)
+		return ERR_PTR(-ENOMEM);
+
+	buffer = iio_dmaengine_buffer_alloc(dev, channel, ops, driver_data);
+	if (IS_ERR(buffer)) {
+		devres_free(bufferp);
+		return buffer;
+	}
+
+	*bufferp = buffer;
+	devres_add(dev, bufferp);
+
+	return buffer;
+}
+EXPORT_SYMBOL_GPL(devm_iio_dmaengine_buffer_alloc);
 
 MODULE_AUTHOR("Lars-Peter Clausen <lars@metafoo.de>");
 MODULE_DESCRIPTION("DMA buffer for the IIO framework");

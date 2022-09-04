@@ -46,7 +46,7 @@ struct iio_buffer_block {
 /**
  * struct iio_buffer_access_funcs - access functions for buffers.
  * @store_to:		actually store stuff to the buffer
- * @read:		try to get a specified number of elements (must exist)
+ * @read:		try to get a specified number of bytes (must exist)
  * @data_available:	indicates how much data is available for reading from
  *			the buffer.
  * @request_update:	if a parameter change has been marked, update underlying
@@ -83,7 +83,7 @@ struct iio_buffer_access_funcs {
 	int (*request_update)(struct iio_buffer *buffer);
 
 	int (*set_bytes_per_datum)(struct iio_buffer *buffer, size_t bpd);
-	int (*set_length)(struct iio_buffer *buffer, int length);
+	int (*set_length)(struct iio_buffer *buffer, unsigned int length);
 
 	int (*enable)(struct iio_buffer *buffer, struct iio_dev *indio_dev);
 	int (*disable)(struct iio_buffer *buffer, struct iio_dev *indio_dev);
@@ -114,10 +114,10 @@ struct iio_buffer_access_funcs {
  */
 struct iio_buffer {
 	/** @length: Number of datums in buffer. */
-	int length;
+	unsigned int length;
 
 	/**  @bytes_per_datum: Size of individual datum including timestamp. */
-	int bytes_per_datum;
+	size_t bytes_per_datum;
 
 	/**
 	 * @access: Buffer access functions associated with the
@@ -141,12 +141,6 @@ struct iio_buffer {
 	unsigned int watermark;
 
 	/* private: */
-	/*
-	 * @scan_el_attrs: Control of scan elements if that scan mode
-	 * control method is used.
-	 */
-	struct attribute_group *scan_el_attrs;
-
 	/* @scan_timestamp: Does the scan mode include a timestamp. */
 	bool scan_timestamp;
 
@@ -162,9 +156,6 @@ struct iio_buffer {
 	 */
 	struct attribute_group scan_el_group;
 
-	/* @stufftoread: Flag to indicate new data. */
-	bool stufftoread;
-
 	/* @attrs: Standard attributes of the buffer. */
 	const struct attribute **attrs;
 
@@ -177,12 +168,6 @@ struct iio_buffer {
 	/* @ref: Reference count of the buffer. */
 	struct kref ref;
 };
-
-static inline int iio_buffer_write(struct iio_buffer *buffer, size_t n,
-	const char __user *buf)
-{
-	return buffer->access->write(buffer, n, buf);
-}
 
 /**
  * iio_update_buffers() - add or remove buffer from active list

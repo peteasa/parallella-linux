@@ -8,7 +8,6 @@
  *        : Hyun Woo Kwon <hyun.kwon@xilinx.com>
  */
 
-#include <drm/drmP.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_crtc.h>
@@ -16,7 +15,9 @@
 #include <drm/drm_fb_cma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_gem_cma_helper.h>
+#include <drm/drm_vblank.h>
 #include <linux/component.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dmaengine.h>
 #include <linux/dma/xilinx_frmbuf.h>
@@ -63,6 +64,8 @@ struct xlnx_dma_chan {
  * @drm: core drm object
  * @fmt: drm color format
  * @vtc_bridge: vtc_bridge structure
+ * @fid: field id
+ * @prev_fid: previous field id
  */
 struct xlnx_pl_disp {
 	struct device *dev;
@@ -76,6 +79,8 @@ struct xlnx_pl_disp {
 	struct drm_device *drm;
 	u32 fmt;
 	struct xlnx_bridge *vtc_bridge;
+	u32 fid;
+	u32 prev_fid;
 };
 
 /*
@@ -163,7 +168,7 @@ static void xlnx_pl_disp_plane_enable(struct drm_plane *plane)
 {
 	struct xlnx_pl_disp *xlnx_pl_disp = plane_to_dma(plane);
 	struct dma_async_tx_descriptor *desc;
-	enum dma_ctrl_flags flags;
+	unsigned long flags;
 	struct xlnx_dma_chan *xlnx_dma_chan = xlnx_pl_disp->chan;
 	struct dma_chan *dma_chan = xlnx_dma_chan->dma_chan;
 	struct dma_interleaved_template *xt = &xlnx_dma_chan->xt;
@@ -177,6 +182,38 @@ static void xlnx_pl_disp_plane_enable(struct drm_plane *plane)
 	}
 	desc->callback = xlnx_pl_disp->callback;
 	desc->callback_param = xlnx_pl_disp->callback_param;
+	xilinx_xdma_set_earlycb(xlnx_dma_chan->dma_chan, desc, EARLY_CALLBACK);
+
+	if (plane->state->crtc->state->adjusted_mode.flags &
+			DRM_MODE_FLAG_INTERLACE) {
+		/*
+		 * Framebuffer DMA Reader sends the first field twice, which
+		 * causes the following fields out of order. The fid is
+		 * reverted to restore the order
+		 */
+		if (plane->state->fb->flags == DRM_MODE_FB_ALTERNATE_TOP) {
+			xlnx_pl_disp->fid = 0;
+		} else if (plane->state->fb->flags ==
+				DRM_MODE_FB_ALTERNATE_BOTTOM) {
+			xlnx_pl_disp->fid = 1;
+		} else {
+			/*
+			 * FIXME: for interlace mode, application may send
+			 * dummy packets before the video field, need to set
+			 * the fid correctly to avoid display distortion
+			 */
+			xlnx_pl_disp->fid = !xlnx_pl_disp->prev_fid;
+		}
+
+		if (xlnx_pl_disp->fid == xlnx_pl_disp->prev_fid) {
+			xlnx_pl_disp_complete(xlnx_pl_disp);
+			return;
+		}
+
+		xilinx_xdma_set_fid(xlnx_dma_chan->dma_chan, desc,
+				    xlnx_pl_disp->fid);
+		xlnx_pl_disp->prev_fid = xlnx_pl_disp->fid;
+	}
 
 	dmaengine_submit(desc);
 	dma_async_issue_pending(xlnx_dma_chan->dma_chan);
@@ -270,9 +307,41 @@ static void xlnx_pl_disp_plane_atomic_update(struct drm_plane *plane,
 	xlnx_pl_disp_plane_enable(plane);
 }
 
+static int
+xlnx_pl_disp_plane_atomic_check(struct drm_plane *plane,
+				struct drm_plane_state *new_plane_state)
+{
+	struct drm_atomic_state *state = new_plane_state->state;
+	const struct drm_plane_state *old_plane_state =
+		drm_atomic_get_old_plane_state(state, plane);
+	struct drm_crtc *crtc = new_plane_state->crtc ?: old_plane_state->crtc;
+	struct drm_crtc_state *new_crtc_state;
+
+	if (!crtc)
+		return 0;
+
+	new_crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+
+	/* plane must be enabled when state is active */
+	if (new_crtc_state->active && !new_plane_state->crtc)
+		return -EINVAL;
+
+	/*
+	 * This check is required to call modeset if there is a change in color
+	 * format
+	 */
+	if (new_plane_state->fb && old_plane_state->fb &&
+	    new_plane_state->fb->format->format !=
+	    old_plane_state->fb->format->format)
+		new_crtc_state->mode_changed = true;
+
+	return 0;
+}
+
 static const struct drm_plane_helper_funcs xlnx_pl_disp_plane_helper_funcs = {
 	.atomic_update = xlnx_pl_disp_plane_atomic_update,
 	.atomic_disable = xlnx_pl_disp_plane_atomic_disable,
+	.atomic_check = xlnx_pl_disp_plane_atomic_check,
 };
 
 static struct drm_plane_funcs xlnx_pl_disp_plane_funcs = {
@@ -294,6 +363,7 @@ static inline struct xlnx_pl_disp *drm_crtc_to_dma(struct drm_crtc *crtc)
 static void xlnx_pl_disp_crtc_atomic_begin(struct drm_crtc *crtc,
 					   struct drm_crtc_state *old_state)
 {
+	drm_crtc_vblank_on(crtc);
 	spin_lock_irq(&crtc->dev->event_lock);
 	if (crtc->state->event) {
 		/* Consume the flip_done event from atomic helper */
@@ -345,7 +415,11 @@ static void xlnx_pl_disp_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	xlnx_pl_disp_plane_disable(crtc->primary);
 	xlnx_pl_disp_clear_event(crtc);
+	drm_crtc_vblank_off(crtc);
 	xlnx_bridge_disable(xlnx_pl_disp->vtc_bridge);
+
+	/* first field is expected to be bottom so init previous field to top */
+	xlnx_pl_disp->prev_fid = 1;
 }
 
 static int xlnx_pl_disp_crtc_atomic_check(struct drm_crtc *crtc,
@@ -449,6 +523,7 @@ static void xlnx_pl_disp_unbind(struct device *dev, struct device *master,
 {
 	struct xlnx_pl_disp *xlnx_pl_disp = dev_get_drvdata(dev);
 
+	xlnx_crtc_unregister(xlnx_pl_disp->drm, &xlnx_pl_disp->xlnx_crtc);
 	drm_plane_cleanup(&xlnx_pl_disp->plane);
 	drm_crtc_cleanup(&xlnx_pl_disp->xlnx_crtc.crtc);
 }
@@ -498,7 +573,8 @@ static int xlnx_pl_disp_probe(struct platform_device *pdev)
 		xlnx_pl_disp->vtc_bridge = of_xlnx_bridge_get(vtc_node);
 		if (!xlnx_pl_disp->vtc_bridge) {
 			dev_info(dev, "Didn't get vtc bridge instance\n");
-			return -EPROBE_DEFER;
+			ret = -EPROBE_DEFER;
+			goto err_dma;
 		}
 	} else {
 		dev_info(dev, "vtc bridge property not present\n");
@@ -517,6 +593,9 @@ static int xlnx_pl_disp_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to initialize the drm pipeline\n");
 		goto err_component;
 	}
+
+	/* first field is expected to be bottom so init previous field to top */
+	xlnx_pl_disp->prev_fid = 1;
 
 	dev_info(&pdev->dev, "Xlnx PL display driver probed\n");
 

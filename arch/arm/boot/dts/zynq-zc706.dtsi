@@ -1,4 +1,6 @@
-/include/ "zynq.dtsi"
+#include "zynq.dtsi"
+
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	model = "Xilinx Zynq ZC706";
@@ -9,7 +11,7 @@
 
 	chosen {
 		bootargs = "console=ttyPS0,115200 root=/dev/mmcblk0p2 rw earlyprintk rootfstype=ext4 rootwait";
-		linux,stdout-path = "/amba@0/uart@E0001000";
+		stdout-path = "/amba@0/uart@E0001000";
 	};
 
 	leds {

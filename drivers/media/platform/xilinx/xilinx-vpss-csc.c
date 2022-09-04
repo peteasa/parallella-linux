@@ -49,6 +49,11 @@
 #define XV_CSC_DEFAULT_WIDTH	(1280)
 #define XV_CSC_K_MAX_ROWS	(3)
 #define XV_CSC_K_MAX_COLUMNS	(3)
+#define XV_CSC_MIN_WIDTH	(64)
+#define XV_CSC_MAX_WIDTH	(8192)
+#define XV_CSC_MIN_HEIGHT	(64)
+#define XV_CSC_MAX_HEIGHT	(4320)
+
 /* GPIO Reset Assert/De-assert */
 #define XCSC_RESET_ASSERT	(1)
 #define XCSC_RESET_DEASSERT	(0)
@@ -157,6 +162,8 @@ rgb_to_ycrcb_unity[XV_CSC_K_MAX_ROWS][XV_CSC_K_MAX_COLUMNS + 1] = {
  * @shadow_coeff: Coefficients to track RGB equivalents for color controls
  * @clip_max: Maximum value to clip output color range
  * @rst_gpio: Handle to PS GPIO specifier to assert/de-assert the reset line
+ * @max_width: Maximum width supported by IP.
+ * @max_height: Maximum height supported by IP.
  */
 struct xcsc_dev {
 	struct xvip_device xvip;
@@ -185,6 +192,8 @@ struct xcsc_dev {
 	s32 shadow_coeff[XV_CSC_K_MAX_ROWS][XV_CSC_K_MAX_COLUMNS + 1];
 	s32 clip_max;
 	struct gpio_desc *rst_gpio;
+	u32 max_width;
+	u32 max_height;
 };
 
 #ifdef DEBUG
@@ -449,18 +458,22 @@ static int xcsc_update_formats(struct xcsc_dev *xcsc)
 
 	switch (color_in) {
 	case MEDIA_BUS_FMT_RBG888_1X24:
+	case MEDIA_BUS_FMT_RBG101010_1X30:
 		dev_dbg(xcsc->xvip.dev, "Media Format In : RGB");
 		xcsc->cft_in = XVIDC_CSF_RGB;
 		break;
 	case MEDIA_BUS_FMT_VUY8_1X24:
+	case MEDIA_BUS_FMT_VUY10_1X30:
 		dev_dbg(xcsc->xvip.dev, "Media Format In : YUV 444");
 		xcsc->cft_in = XVIDC_CSF_YCRCB_444;
 		break;
 	case MEDIA_BUS_FMT_UYVY8_1X16:
+	case MEDIA_BUS_FMT_UYVY10_1X20:
 		dev_dbg(xcsc->xvip.dev, "Media Format In : YUV 422");
 		xcsc->cft_in = XVIDC_CSF_YCRCB_422;
 		break;
 	case MEDIA_BUS_FMT_VYYUYY8_1X24:
+	case MEDIA_BUS_FMT_VYYUYY10_4X20:
 		dev_dbg(xcsc->xvip.dev, "Media Format In : YUV 420");
 		xcsc->cft_in = XVIDC_CSF_YCRCB_420;
 		break;
@@ -468,6 +481,7 @@ static int xcsc_update_formats(struct xcsc_dev *xcsc)
 
 	switch (color_out) {
 	case MEDIA_BUS_FMT_RBG888_1X24:
+	case MEDIA_BUS_FMT_RBG101010_1X30:
 		xcsc->cft_out = XVIDC_CSF_RGB;
 		dev_dbg(xcsc->xvip.dev, "Media Format Out : RGB");
 		if (color_in != MEDIA_BUS_FMT_RBG888_1X24)
@@ -476,6 +490,7 @@ static int xcsc_update_formats(struct xcsc_dev *xcsc)
 			xcsc_set_unity_matrix(xcsc);
 		break;
 	case MEDIA_BUS_FMT_VUY8_1X24:
+	case MEDIA_BUS_FMT_VUY10_1X30:
 		xcsc->cft_out = XVIDC_CSF_YCRCB_444;
 		dev_dbg(xcsc->xvip.dev, "Media Format Out : YUV 444");
 		if (color_in == MEDIA_BUS_FMT_RBG888_1X24)
@@ -484,6 +499,7 @@ static int xcsc_update_formats(struct xcsc_dev *xcsc)
 			xcsc_set_unity_matrix(xcsc);
 		break;
 	case MEDIA_BUS_FMT_UYVY8_1X16:
+	case MEDIA_BUS_FMT_UYVY10_1X20:
 		xcsc->cft_out = XVIDC_CSF_YCRCB_422;
 		dev_dbg(xcsc->xvip.dev, "Media Format Out : YUV 422");
 		if (color_in == MEDIA_BUS_FMT_RBG888_1X24)
@@ -492,6 +508,7 @@ static int xcsc_update_formats(struct xcsc_dev *xcsc)
 			xcsc_set_unity_matrix(xcsc);
 		break;
 	case MEDIA_BUS_FMT_VYYUYY8_1X24:
+	case MEDIA_BUS_FMT_VYYUYY10_4X20:
 		xcsc->cft_out = XVIDC_CSF_YCRCB_420;
 		dev_dbg(xcsc->xvip.dev, "Media Format Out : YUV 420");
 		if (color_in ==  MEDIA_BUS_FMT_RBG888_1X24)
@@ -525,14 +542,22 @@ __xcsc_get_pad_format(struct xcsc_dev *xcsc,
 		      struct v4l2_subdev_pad_config *cfg,
 		      unsigned int pad, u32 which)
 {
+	struct v4l2_mbus_framefmt *format;
+
 	switch (which) {
 	case V4L2_SUBDEV_FORMAT_TRY:
-		return v4l2_subdev_get_try_format(&xcsc->xvip.subdev, cfg, pad);
+		format = v4l2_subdev_get_try_format(&xcsc->xvip.subdev,
+						    cfg, pad);
+		break;
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
-		return &xcsc->formats[pad];
+		format = &xcsc->formats[pad];
+		break;
 	default:
-		return NULL;
+		format = NULL;
+		break;
 	}
+
+	return format;
 }
 
 static void
@@ -743,8 +768,13 @@ static int xcsc_get_format(struct v4l2_subdev *subdev,
 			   struct v4l2_subdev_format *fmt)
 {
 	struct xcsc_dev *xcsc = to_csc(subdev);
+	struct v4l2_mbus_framefmt *format;
 
-	fmt->format = *__xcsc_get_pad_format(xcsc, cfg, fmt->pad, fmt->which);
+	format = __xcsc_get_pad_format(xcsc, cfg, fmt->pad, fmt->which);
+	if (!format)
+		return -EINVAL;
+
+	fmt->format = *format;
 	return 0;
 }
 
@@ -757,16 +787,31 @@ static int xcsc_set_format(struct v4l2_subdev *subdev,
 	struct v4l2_mbus_framefmt *__propagate;
 
 	__format = __xcsc_get_pad_format(xcsc, cfg, fmt->pad, fmt->which);
+	if (!__format)
+		return -EINVAL;
+
 	/* Propagate to Source Pad */
 	__propagate = __xcsc_get_pad_format(xcsc, cfg,
 					    XVIP_PAD_SOURCE, fmt->which);
+	if (!__propagate)
+		return -EINVAL;
+
 	*__format = fmt->format;
+
+	__format->width = clamp_t(unsigned int, fmt->format.width,
+				  XV_CSC_MIN_WIDTH, xcsc->max_width);
+	__format->height = clamp_t(unsigned int, fmt->format.height,
+				   XV_CSC_MIN_HEIGHT, xcsc->max_height);
 
 	switch (__format->code) {
 	case MEDIA_BUS_FMT_VUY8_1X24:
 	case MEDIA_BUS_FMT_RBG888_1X24:
+	case MEDIA_BUS_FMT_RBG101010_1X30:
 	case MEDIA_BUS_FMT_UYVY8_1X16:
 	case MEDIA_BUS_FMT_VYYUYY8_1X24:
+	case MEDIA_BUS_FMT_VYYUYY10_4X20:
+	case MEDIA_BUS_FMT_UYVY10_1X20:
+	case MEDIA_BUS_FMT_VUY10_1X30:
 		break;
 	default:
 		/* Unsupported Format. Default to RGB */
@@ -939,7 +984,27 @@ static int xcsc_parse_of(struct xcsc_dev *xcsc)
 	struct device_node *ports, *port;
 	int rval;
 	u32 port_id = 0;
-	u32 video_width[2];
+	u32 video_width[2] = {0};
+
+	rval = of_property_read_u32(node, "xlnx,max-height", &xcsc->max_height);
+	if (rval < 0) {
+		dev_err(dev, "xlnx,max-height is missing!");
+		return -EINVAL;
+	} else if (xcsc->max_height > XV_CSC_MAX_HEIGHT ||
+		   xcsc->max_height < XV_CSC_MIN_HEIGHT) {
+		dev_err(dev, "Invalid height in dt");
+		return -EINVAL;
+	}
+
+	rval = of_property_read_u32(node, "xlnx,max-width", &xcsc->max_width);
+	if (rval < 0) {
+		dev_err(dev, "xlnx,max-width is missing!");
+		return -EINVAL;
+	} else if (xcsc->max_width > XV_CSC_MAX_WIDTH ||
+		   xcsc->max_width < XV_CSC_MIN_WIDTH) {
+		dev_err(dev, "Invalid width in dt");
+		return -EINVAL;
+	}
 
 	ports = of_get_child_by_name(node, "ports");
 	if (!ports)
@@ -982,8 +1047,10 @@ static int xcsc_parse_of(struct xcsc_dev *xcsc)
 	}
 	switch (video_width[0]) {
 	case XVIDC_BPC_8:
+		xcsc->color_depth = XVIDC_BPC_8;
+		break;
 	case XVIDC_BPC_10:
-		xcsc->color_depth = video_width[0];
+		xcsc->color_depth = XVIDC_BPC_10;
 		break;
 	default:
 		dev_err(dev, "Unsupported color depth %d", video_width[0]);

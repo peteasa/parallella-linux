@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /**
  * \file talise_arm.c
  * \brief Contains functions to support interfacing with the TALISE internal
  *          ARM processor
  *
- * Talise API version: 3.6.0.5
+ * Talise API version: 3.6.2.1
  *
  * Copyright 2015-2017 Analog Devices Inc.
  * Released under the AD9378-AD9379 API license, for more information see the "LICENSE.txt" file in this zip file.
@@ -114,7 +115,6 @@ uint32_t TALISE_initArm(taliseDevice_t *device, taliseInit_t *init)
 
 uint32_t TALISE_writeArmProfile(taliseDevice_t *device, taliseInit_t *init)
 {
-    adiHalErr_t halError = ADIHAL_OK;
     talRecoveryActions_t retVal = TALACT_NO_ACTION;
     talRecoveryActions_t retValWarn = TALACT_NO_ACTION;
     int32_t i = 0;
@@ -126,6 +126,7 @@ uint32_t TALISE_writeArmProfile(taliseDevice_t *device, taliseInit_t *init)
     static const uint8_t length = 84;
 
 #if TALISE_VERBOSE
+    adiHalErr_t halError = ADIHAL_OK;
     halError = talWriteToLog(device->devHalInfo, ADIHAL_LOG_MSG, TAL_ERR_OK, "TALISE_writeArmConfig()\n");
     retVal = talApiErrHandler(device, TAL_ERRHDL_HAL_LOG, halError, retVal, TALACT_WARN_RESET_LOG);
 #endif
@@ -555,7 +556,6 @@ static void talFormatAdcProfileByteArray(uint8_t *armMemByteArray, uint16_t *adc
 uint32_t TALISE_loadAdcProfiles(taliseDevice_t *device, uint16_t *rxAdcProfile, uint16_t *orxLowPassAdcProfile,
         uint16_t *orxBandPassAdcProfile, uint16_t *loopBackAdcProfile, int16_t *orxMergeFilter)
 {
-    adiHalErr_t halError = ADIHAL_OK;
     talRecoveryActions_t retVal = TALACT_NO_ACTION;
     talRecoveryActions_t retValWarn = TALACT_NO_ACTION;
     uint8_t i = 0;
@@ -568,6 +568,7 @@ uint32_t TALISE_loadAdcProfiles(taliseDevice_t *device, uint16_t *rxAdcProfile, 
     static const uint32_t ARM_ORXMERGEFILTERPROFILE_OFFSET = 332;
 
 #if TALISE_VERBOSE
+    adiHalErr_t halError = ADIHAL_OK;
     halError = talWriteToLog(device->devHalInfo, ADIHAL_LOG_MSG, TAL_ERR_OK, "TALISE_loadAdcProfiles\n");
     retVal = talApiErrHandler(device, TAL_ERRHDL_HAL_LOG, halError, retVal, TALACT_WARN_RESET_LOG);
 #endif
@@ -864,13 +865,13 @@ uint32_t TALISE_writeArmMem(taliseDevice_t *device, uint32_t address, uint8_t *d
 
 uint32_t TALISE_writeArmConfig(taliseDevice_t *device, uint8_t objectId, uint16_t offset, uint8_t *data, uint8_t byteCount)
 {
-    adiHalErr_t halError = ADIHAL_OK;
     talRecoveryActions_t retVal = TALACT_NO_ACTION;
     talRecoveryActions_t retValWarn = TALACT_NO_ACTION;
     uint8_t extendedData[4] = {0};
     uint8_t cmdStatusByte = 0;
 
 #if TALISE_VERBOSE
+    adiHalErr_t halError = ADIHAL_OK;
     halError = talWriteToLog(device->devHalInfo, ADIHAL_LOG_MSG, TAL_ERR_OK, "TALISE_writeArmConfig()\n");
     retVal = talApiErrHandler(device, TAL_ERRHDL_HAL_LOG, halError, retVal, TALACT_WARN_RESET_LOG);
 #endif
@@ -911,7 +912,6 @@ uint32_t TALISE_writeArmConfig(taliseDevice_t *device, uint8_t objectId, uint16_
 
 uint32_t TALISE_readArmConfig(taliseDevice_t *device, uint8_t objectId, uint16_t offset, uint8_t *data, uint8_t byteCount)
 {
-    adiHalErr_t halError = ADIHAL_OK;
     talRecoveryActions_t retVal = TALACT_NO_ACTION;
     talRecoveryActions_t retValWarn = TALACT_NO_ACTION;
     uint8_t extendedData[4] = {0};
@@ -920,6 +920,7 @@ uint32_t TALISE_readArmConfig(taliseDevice_t *device, uint8_t objectId, uint16_t
     static const uint8_t AUTO_INC_BIT = 0;
 
 #if TALISE_VERBOSE
+    adiHalErr_t halError = ADIHAL_OK;
     halError = talWriteToLog(device->devHalInfo, ADIHAL_LOG_MSG, TAL_ERR_OK, "TALISE_readArmConfig()\n");
     retVal = talApiErrHandler(device, TAL_ERRHDL_HAL_LOG, halError, retVal, TALACT_WARN_RESET_LOG);
 #endif
@@ -1193,11 +1194,11 @@ uint32_t TALISE_sendArmCommand(taliseDevice_t *device, uint8_t opCode, const uin
 uint32_t TALISE_getArmVersion_v2(taliseDevice_t *device, taliseArmVersionInfo_t *talArmVersionInfo)
 {
     talRecoveryActions_t retVal = TALACT_NO_ACTION;
-    adiHalErr_t halError = ADIHAL_OK;
     uint8_t ver[5] = {0};
     uint32_t fullVersion = 0;
 
 #if TALISE_VERBOSE
+    adiHalErr_t halError = ADIHAL_OK;
     halError = talWriteToLog(device->devHalInfo, ADIHAL_LOG_MSG, TAL_ERR_OK, "TALISE_getArmVersion()\n");
     retVal = talApiErrHandler(device, TAL_ERRHDL_HAL_LOG, halError, retVal, TALACT_WARN_RESET_LOG);
 #endif
@@ -1239,11 +1240,11 @@ uint32_t TALISE_getArmVersion_v2(taliseDevice_t *device, taliseArmVersionInfo_t 
 uint32_t TALISE_getArmVersion(taliseDevice_t *device, uint8_t *majorVer, uint8_t *minorVer, uint8_t *rcVer)
 {
     talRecoveryActions_t retVal = TALACT_NO_ACTION;
-    adiHalErr_t halError = ADIHAL_OK;
     uint8_t ver[4] = {0};
     uint32_t fullVersion = 0;
 
 #if TALISE_VERBOSE
+    adiHalErr_t halError = ADIHAL_OK;
     halError = talWriteToLog(device->devHalInfo, ADIHAL_LOG_MSG, TAL_ERR_OK, "TALISE_getArmVersion()\n");
     retVal = talApiErrHandler(device, TAL_ERRHDL_HAL_LOG, halError, retVal, TALACT_WARN_RESET_LOG);
 #endif
