@@ -767,8 +767,9 @@ static void elink_disable(struct elink_device *elink)
 
 static int elink_regulator_enable(struct elink_device *elink)
 {
-	int ret, i, old_vdd, new_vdd, step, wiggle;
-	bool extra_delay;
+	int ret = 0;
+	int i, old_vdd, new_vdd, step, wiggle;
+	bool extra_delay = false;
 	const struct epiphany_chip_info *cinfo =
 		&epiphany_chip_info[elink->chip_type];
 
@@ -782,43 +783,52 @@ static int elink_regulator_enable(struct elink_device *elink)
 	new_vdd = min(old_vdd, cinfo->vdd_max);
 	step = regulator_get_linear_step(elink->supply);
 
-	ret = -EINVAL;
-
-	if (cinfo->vdd_min <= elink->vdd_wanted &&
-	    elink->vdd_wanted <= cinfo->vdd_max) {
-		new_vdd = elink->vdd_wanted;
-		wiggle = min(new_vdd + step, cinfo->vdd_max);
-		ret = regulator_set_voltage(elink->supply, elink->vdd_wanted,
-					    wiggle);
-	}
-
-	if (ret) {
-		for (i = 0; i < E_PS_NUM_STATES; i++) {
-			new_vdd = cinfo->perf_state[i].vdd_thresh;
+	if (old_vdd != new_vdd) {
+		ret = -EINVAL;
+		if (cinfo->vdd_min <= elink->vdd_wanted &&
+		    elink->vdd_wanted <= cinfo->vdd_max) {
+			new_vdd = elink->vdd_wanted;
 			wiggle = min(new_vdd + step, cinfo->vdd_max);
-			ret = regulator_set_voltage(elink->supply,
-					new_vdd, wiggle);
-			if (!ret)
-				break;
+			ret = regulator_set_voltage(elink->supply, elink->vdd_wanted,
+						    wiggle);
+		}
+
+		if (ret) {
+			for (i = 0; i < E_PS_NUM_STATES; i++) {
+				new_vdd = cinfo->perf_state[i].vdd_thresh;
+				wiggle = min(new_vdd + step, cinfo->vdd_max);
+				ret = regulator_set_voltage(elink->supply,
+						new_vdd, wiggle);
+				if (!ret)
+					break;
+			}
+		}
+
+		if (ret)
+			return ret;
+
+		/* Pessimistic sleep if regulator doesn't provide a ramp-up time, then
+		 * it didn't block in regulator_set_voltage(). ???: And will also
+		 * not block in regulator_enable() ??? */
+
+		extra_delay =
+			(0 >= regulator_set_voltage_time(elink->supply,
+							 cinfo->vdd_min,
+							 cinfo->vdd_max))
+			? true : false;
+
+		if (extra_delay && old_vdd != new_vdd)
+			msleep(100);
+
+		if (old_vdd != new_vdd) {
+			old_vdd = regulator_get_voltage(elink->supply);
 		}
 	}
-	if (ret)
-		return ret;
-
-	/* Pessimistic sleep if regulator doesn't provide a ramp-up time, then
-	 * it didn't block in regulator_set_voltage(). ???: And will also
-	 * not block in regulator_enable() ??? */
-
-	extra_delay =
-		(0 >= regulator_set_voltage_time(elink->supply,
-						 cinfo->vdd_min,
-						 cinfo->vdd_max))
-		? true : false;
-
-	if (extra_delay && old_vdd != new_vdd)
-		msleep(100);
 
 	ret = regulator_enable(elink->supply);
+	if (ret) {
+		return ret;
+	}
 
 	if (extra_delay)
 		usleep_range(20000, 20100);
