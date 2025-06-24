@@ -1214,7 +1214,7 @@ static vm_fault_t epiphany_vm_fault(struct vm_fault *vmf)
 {
 	unsigned long phys_pfn;
 	struct elink_device *elink = vma_to_elink(vmf->vma);
-	int ret;
+	int ret = 0;
 
 	if (mutex_lock_interruptible(&epiphany.driver_lock)) {
 		ret = -ERESTARTSYS;
@@ -1240,12 +1240,16 @@ out_unlock:
 out:
 	switch (ret) {
 	case 0:
+	case -EOVERFLOW:
+	case -EINVAL:
+	case -EACCES:
 	case -ERESTARTSYS:
 	case -EINTR:
 	case -EBUSY:
 		return VM_FAULT_NOPAGE;
 	default:
-		return VM_FAULT_SIGBUS;
+		// result of vmf_insert_pfn() see vmf_insert_pfn() in memory.c
+		return ret;
 	}
 }
 
